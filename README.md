@@ -53,6 +53,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Signal Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown that suppresses a repeated setup.
 - **TwelveData by Default**: Candles come from TwelveData. An OANDA v20 practice account is supported but stays switched off until you explicitly enable it with `DATA_PROVIDER=oanda`.
+- **Durable Archive (Turso/libSQL or SQLite)**: Closed candles are stored once per timeframe, every alert with its outcome, and every AI review — so hit rates can be rebuilt after a redeploy instead of resetting. Turso is used when `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set, otherwise a local SQLite file.
 - **Signal Journal**: Every alert is recorded with its SL/TP and later resolved to TP or SL from the candles that follow, giving real hit rates per direction and confidence band instead of guesswork.
 - **AI Second Opinion**: When `OPENROUTER_API_KEY` is set, a second Telegram message carries an LLM review of the rule signal (verdict, confidence, reasons) informed by those hit rates. The AI never changes entry/SL/TP and a failed AI call never blocks the alert.
 - **Manual Scan**: Send `/scan` to the bot's Telegram chat to run an immediate scan instead of waiting for the next 5-minute candle close. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
@@ -124,6 +125,9 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `OPENROUTER_MODEL` | Optional. Default `deepseek/deepseek-v4.1-flash-1017`. Pin a dated snapshot ID. |
 | `AI_TIMEOUT` | Optional. Seconds before the AI call is abandoned (default `20`). |
 | `JOURNAL_FILE` | Optional. Where sent signals and their outcomes are stored (default `signal_journal.json`). |
+| `TURSO_DATABASE_URL` | Optional. Turso/libSQL URL, e.g. `libsql://mydb.turso.io`. Used together with `TURSO_AUTH_TOKEN`. |
+| `TURSO_AUTH_TOKEN` | Optional. Token for the Turso database. Without both Turso values the bot uses local SQLite. |
+| `DB_FILE` | Optional. SQLite file used when Turso is not configured (default `signals.db`). |
 
 ---
 

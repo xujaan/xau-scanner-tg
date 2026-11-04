@@ -226,3 +226,6 @@ signal_state.json
 signal_state.json.tmp
 signal_journal.json
 signal_journal.json.tmp
+signals.db
+signals.db-wal
+signals.db-shm

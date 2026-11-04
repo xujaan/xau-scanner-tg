@@ -37,6 +37,19 @@ spec:
             # root filesystem is read-only; matplotlib needs a writable cache
             - name: MPLCONFIGDIR
               value: /tmp/mpl
+            # Everything the bot writes lives under /data (emptyDir here).
+            # With TURSO_DATABASE_URL set the DB is remote, but the state and
+            # journal files still need a writable path.
+            - name: STATE_FILE
+              value: /data/signal_state.json
+            - name: JOURNAL_FILE
+              value: /data/signal_journal.json
+            - name: DB_FILE
+              value: /data/signals.db
+            - name: DATA_PROVIDER
+              value: twelvedata
+            - name: OPENROUTER_MODEL
+              value: deepseek/deepseek-v4.1-flash-1017
           resources:
             requests:
               cpu: 50m
@@ -52,6 +65,10 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: data
+              mountPath: /data
       volumes:
         - name: tmp
+          emptyDir: {}
+        - name: data
           emptyDir: {}

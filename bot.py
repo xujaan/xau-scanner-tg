@@ -1,6 +1,7 @@
 import json
 import os
 import requests
+import sqlite3
 import threading
 import time
 from datetime import datetime
@@ -35,6 +36,12 @@ AI_ENABLED         = bool(OPENROUTER_API_KEY)
 AI_TIMEOUT         = int(os.environ.get("AI_TIMEOUT", 20))
 JOURNAL_FILE       = os.environ.get("JOURNAL_FILE", "signal_journal.json")
 JOURNAL_MAX        = 200
+
+# Durable storage: Turso/libSQL when credentials are set, otherwise a local SQLite
+# file. DB problems are logged and swallowed — they must never stop the bot.
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
+DB_FILE            = os.environ.get("DB_FILE", "signals.db")
 
 SYMBOL       = "XAU/USD"
 CAPITAL      = 200
@@ -112,6 +119,145 @@ def format_wait(history, now_ts=None):
     return "now" if wait <= 0 else f"{wait // 3600}h {(wait % 3600) // 60}m"
 
 # ============================================
+# DATABASE  (Turso/libSQL over HTTP, or local SQLite)
+# ============================================
+DB_SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS bars (
+         symbol TEXT NOT NULL, timeframe TEXT NOT NULL, bar_time TEXT NOT NULL,
+         open REAL, high REAL, low REAL, close REAL,
+         PRIMARY KEY (symbol, timeframe, bar_time))""",
+    """CREATE TABLE IF NOT EXISTS signals (
+         id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+         direction TEXT NOT NULL, entry REAL, sl REAL, tp REAL, confidence INTEGER,
+         outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
+         ai_verdict TEXT, ai_confidence INTEGER)""",
+    """CREATE TABLE IF NOT EXISTS ai_reviews (
+         ts REAL, model TEXT, verdict TEXT, confidence INTEGER,
+         reasons TEXT, risk_note TEXT, latency_ms INTEGER)""",
+]
+
+def db_backend():
+    return "turso" if (TURSO_DATABASE_URL and TURSO_AUTH_TOKEN) else "sqlite"
+
+def _turso_endpoint():
+    host = TURSO_DATABASE_URL
+    if host.startswith("libsql://"):
+        host = "https://" + host[len("libsql://"):]
+    elif host.startswith("http://"):
+        host = "https://" + host[len("http://"):]
+    return host.rstrip("/") + "/v2/pipeline"
+
+def _turso_arg(value):
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "integer", "value": str(int(value))}
+    if isinstance(value, int):
+        return {"type": "integer", "value": str(value)}
+    if isinstance(value, float):
+        return {"type": "float", "value": value}
+    return {"type": "text", "value": str(value)}
+
+def _turso_cell(cell):
+    kind, raw = cell.get("type"), cell.get("value")
+    if kind == "null" or raw is None:
+        return None
+    if kind == "integer":
+        return int(raw)
+    if kind == "float":
+        return float(raw)
+    return raw
+
+def _turso_run(statements):
+    """Send all statements in a single pipeline request."""
+    body = {"requests": [{"type": "execute",
+                          "stmt": {"sql": sql, "args": [_turso_arg(p) for p in params]}}
+                         for sql, params in statements]}
+    body["requests"].append({"type": "close"})
+    r = requests.post(_turso_endpoint(), json=body, timeout=15,
+                      headers={"Authorization": f"Bearer {TURSO_AUTH_TOKEN}",
+                               "Content-Type": "application/json"})
+    if r.status_code != 200:
+        raise RuntimeError(f"Turso HTTP {r.status_code}: {r.text[:200]}")
+    rows = []
+    for result in r.json().get("results", []):
+        if result.get("type") != "ok":
+            raise RuntimeError(f"Turso error: {result}")
+        block = (result.get("response") or {}).get("result") or {}
+        for row in block.get("rows", []):
+            rows.append([_turso_cell(c) for c in row])
+    return rows
+
+def db_run(statements, fetch=False):
+    """Execute (sql, params) pairs. Never raises: storage is best-effort."""
+    try:
+        if db_backend() == "turso":
+            return _turso_run(statements)
+        rows = []
+        with sqlite3.connect(DB_FILE) as conn:
+            for sql, params in statements:
+                cur = conn.execute(sql, params)
+                if fetch:
+                    rows = [list(r) for r in cur.fetchall()]
+            conn.commit()
+        return rows
+    except Exception as e:
+        print(f"DB error: {e}")
+        return []
+
+def db_init():
+    db_run([(sql, ()) for sql in DB_SCHEMA])
+    print(f"DB: {db_backend()} ({TURSO_DATABASE_URL if db_backend() == 'turso' else DB_FILE})")
+
+def db_save_bars(candles, timeframe):
+    """Store closed bars once; re-scanning the same candles adds nothing."""
+    if not candles:
+        return
+    db_run([("INSERT OR IGNORE INTO bars (symbol, timeframe, bar_time, open, high, low, close) "
+             "VALUES (?,?,?,?,?,?,?)",
+             (SYMBOL, timeframe, c["time"], c["open"], c["high"], c["low"], c["close"]))
+            for c in candles])
+
+def db_save_signal(rec):
+    db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
+             "closed_ts, last_bar, ai_verdict, ai_confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             (rec["ts"], rec["direction"], rec.get("entry"), rec.get("sl"), rec.get("tp"),
+              rec.get("confidence"), rec.get("outcome", "OPEN"), rec.get("closed_ts"),
+              rec.get("last_bar"), rec.get("ai_verdict"), rec.get("ai_confidence")))])
+
+def db_update_signal(rec):
+    db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=? WHERE ts=? AND direction=?",
+             (rec.get("outcome"), rec.get("closed_ts"), rec.get("last_bar"),
+              rec["ts"], rec["direction"]))])
+
+DB_SIGNAL_COLUMNS = ("ts", "direction", "entry", "sl", "tp", "confidence",
+                     "outcome", "closed_ts", "last_bar", "ai_verdict", "ai_confidence")
+
+def db_load_journal(limit=None):
+    rows = db_run([("SELECT ts, direction, entry, sl, tp, confidence, outcome, closed_ts, "
+                    "last_bar, ai_verdict, ai_confidence FROM signals ORDER BY ts DESC LIMIT ?",
+                    (limit or JOURNAL_MAX,))], fetch=True)
+    return [dict(zip(DB_SIGNAL_COLUMNS, row)) for row in reversed(rows)]
+
+def db_save_ai_review(rec, model, opinion, latency_ms):
+    db_run([("INSERT INTO ai_reviews (ts, model, verdict, confidence, reasons, risk_note, latency_ms) "
+             "VALUES (?,?,?,?,?,?,?)",
+             (rec["ts"], model, opinion["verdict"], opinion["confidence"],
+              json.dumps(opinion["reasons"]), opinion["risk_note"], latency_ms))])
+
+def db_migrate_journal(records):
+    """Seed the DB from the JSON journal once so earlier history survives."""
+    if not records:
+        return 0
+    db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
+             "closed_ts, last_bar, ai_verdict, ai_confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             (r["ts"], r["direction"], r.get("entry"), r.get("sl"), r.get("tp"),
+              r.get("confidence"), r.get("outcome", "OPEN"), r.get("closed_ts"),
+              r.get("last_bar"), r.get("ai_verdict"), r.get("ai_confidence")))
+            for r in records])
+    return len(records)
+
+# ============================================
 # SIGNAL JOURNAL  (every alert, and how it resolved)
 # ============================================
 def load_journal():
@@ -154,6 +300,7 @@ def record_signal(journal, sig, opinion=None):
         "ai_confidence": (opinion or {}).get("confidence"),
     })
     save_journal(journal)
+    db_save_signal(journal[-1])
     return journal
 
 def evaluate_journal(journal, candles):
@@ -184,6 +331,7 @@ def evaluate_journal(journal, candles):
                 rec["closed_ts"] = time.time()
                 break
         rec["last_bar"] = last
+        db_update_signal(rec)
         changed = True
     if changed:
         save_journal(journal)
@@ -1152,8 +1300,15 @@ def main():
                   else f"no cap ({SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown)")
     print(f"Quota: {quota_line} | {len(signals_sent)} loaded from {STATE_FILE}")
 
-    journal = load_journal()
-    print(f"Journal: {len(journal)} signals from {JOURNAL_FILE}")
+    db_init()
+    journal = db_load_journal()
+    if not journal:
+        legacy = load_journal()
+        if legacy:
+            db_migrate_journal(legacy)
+            journal = db_load_journal()
+            print(f"Journal: migrated {len(legacy)} records from {JOURNAL_FILE} into the DB")
+    print(f"Journal: {len(journal)} signals loaded")
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
     scan_event = threading.Event()
@@ -1214,6 +1369,8 @@ def main():
 
             journal = evaluate_journal(journal, candles_5m)
             stats   = journal_stats(journal)
+            db_save_bars(candles_5m, "5min")
+            db_save_bars(candles_15m, "15min")
 
             sig = generate_signal(candles_5m, candles_15m)
 
@@ -1230,10 +1387,13 @@ def main():
                           f"{format_wait(signals_sent, now_ts)}")
                 else:
                     send_signal(sig, candles_5m)
+                    ai_started = time.time()
                     opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
+                    journal = record_signal(journal, sig, opinion)
                     if opinion:
                         send_ai_opinion(sig, opinion, stats)
-                    journal = record_signal(journal, sig, opinion)
+                        db_save_ai_review(journal[-1], OPENROUTER_MODEL, opinion,
+                                          int((time.time() - ai_started) * 1000))
                     signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
                     save_state(signals_sent)
                     if QUOTA_ENABLED:
