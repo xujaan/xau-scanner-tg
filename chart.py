@@ -21,6 +21,7 @@ BG, FG, GRID = "#0e1117", "#d7dce3", "#2a2f3a"
 GREEN, RED, ENTRY_C = "#26a69a", "#ef5350", "#4f9cf9"
 OB_C, FVG_C, LIQ_C, RSI_C = "#f0b90b", "#9b6bf2", "#ff9f43", "#c792ea"
 MUTED = "#8b93a1"
+WATERMARK = "https://t.me/xujaan"
 
 
 def levels(sig):
@@ -204,6 +205,8 @@ def build_signal_chart(sig, candles, bars=60, path=None):
     # ---------- footer ----------
     fig.text(0.01, 0.012, f"{sig.get('tf_bias', '')}  |  {data[-1]['time']}",
              color=MUTED, fontsize=8, ha="left")
+    fig.text(0.5, 0.012, WATERMARK, color=ENTRY_C, fontsize=8.5, ha="center",
+             fontweight="bold")
     fig.text(0.995, 0.012, "PAPER SIGNAL - NOT EXECUTED", color=MUTED,
              fontsize=8, ha="right")
 
