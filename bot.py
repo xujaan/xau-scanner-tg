@@ -1308,6 +1308,9 @@ def main():
             db_migrate_journal(legacy)
             journal = db_load_journal()
             print(f"Journal: migrated {len(legacy)} records from {JOURNAL_FILE} into the DB")
+        if not journal and legacy:
+            journal = legacy
+            print("Journal: DB empty or unavailable — continuing from the JSON journal.")
     print(f"Journal: {len(journal)} signals loaded")
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
