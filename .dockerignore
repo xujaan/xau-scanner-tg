@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+bot.log
+bot.pid
+*.bak
+k8s/
+README.md

@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: xau-scanner
+  labels:
+    app: xau-scanner
+spec:
+  replicas: 1
+  # Recreate: never run two instances at once, or the TwelveData
+  # daily quota (800 requests) is consumed twice as fast.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: xau-scanner
+  template:
+    metadata:
+      labels:
+        app: xau-scanner
+    spec:
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: bot
+          # Ganti dengan image Docker Hub Anda
+          image: xujaan/xau-scanner-tg:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: xau-scanner-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
