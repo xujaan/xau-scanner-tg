@@ -1,6 +1,7 @@
 import json
 import os
 import requests
+import threading
 import time
 from datetime import datetime
 import pytz
@@ -118,6 +119,57 @@ def send_photo(photo_path, caption=""):
     except Exception as e:
         print(f"Telegram photo error: {e}")
         return False
+
+# ============================================
+# MANUAL SCAN  (/scan in Telegram)
+# ============================================
+def handle_command_update(update, scan_event):
+    """Trigger a scan for a /scan command from the configured chat.
+    Returns True when a scan was requested."""
+    message = update.get("message") or {}
+    text    = (message.get("text") or "").strip()
+    chat_id = str((message.get("chat") or {}).get("id", ""))
+
+    if not text.startswith("/"):
+        return False
+    if chat_id != str(TELEGRAM_CHAT_ID):
+        print(f"Ignored command from unknown chat {chat_id}")
+        return False
+    if text.split("@")[0].lower() != "/scan":
+        return False
+
+    scan_event.set()
+    send_telegram("🔍 <b>Manual scan requested</b>\nScanning now...")
+    print("Manual scan requested via Telegram.")
+    return True
+
+def command_listener(scan_event):
+    """Poll Telegram for /scan while the main loop runs on this thread."""
+    token = TELEGRAM_TOKEN
+    url   = f"https://api.telegram.org/bot{token}/getUpdates"
+    offset = None
+
+    # getUpdates fails with 409 if a webhook is registered. This bot never sets
+    # one, so this is a no-op unless something else registered one.
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/deleteWebhook",
+                      json={"drop_pending_updates": False}, timeout=10)
+    except Exception as e:
+        print(f"Command listener setup error: {e}")
+
+    while True:
+        try:
+            params = {"timeout": 0, "allowed_updates": '["message"]'}
+            if offset is not None:
+                params["offset"] = offset
+            r    = requests.get(url, params=params, timeout=15)
+            data = r.json()
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                handle_command_update(update, scan_event)
+        except Exception as e:
+            print(f"Command listener error: {e}")
+        time.sleep(5)
 
 # ============================================
 # FETCH CANDLES
@@ -775,6 +827,13 @@ def main():
                   else f"no cap ({SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown)")
     print(f"Quota: {quota_line} | {len(signals_sent)} loaded from {STATE_FILE}")
 
+    scan_event = threading.Event()
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        threading.Thread(target=command_listener, args=(scan_event,), daemon=True).start()
+        print(f"Manual scan: send /scan to chat {TELEGRAM_CHAT_ID}.")
+    else:
+        print("Manual scan: disabled (Telegram credentials missing).")
+
     send_telegram(
         f"🚀 <b>XAUUSD SMC Bot LIVE</b>\n\n"
         f"{'🧪 PAPER MODE' if PAPER_MODE else '⚡ LIVE MODE'}\n\n"
@@ -802,8 +861,16 @@ def main():
             # The quota limits alerts, never the scan — setups we cannot send
             # are still logged so nothing is silently missed.
             if market_closed():
+                if scan_event.is_set():
+                    scan_event.clear()
+                    print("Manual scan ignored: market closed.")
+                    send_telegram(
+                        "⚠️ <b>Market closed</b>\n"
+                        "Gold trades Sun 18:00 – Fri 17:00 ET "
+                        "(daily break 17:00–18:00 ET)."
+                    )
                 print("Market closed. Sleeping 15min...")
-                time.sleep(900)
+                scan_event.wait(timeout=900)
                 continue
 
             print("Fetching candles...")
@@ -846,11 +913,13 @@ def main():
             else:
                 print("No signal. Waiting...")
 
-            # Clock-sync: wake exactly at next 5M candle close
-            ts        = time.time()
+            # Clock-sync: wake exactly at next 5M candle close, or early on /scan
+            ts         = time.time()
             sleep_time = (300 - (ts % 300)) + 3
             print(f"Sleeping {int(sleep_time)}s until next candle close...")
-            time.sleep(sleep_time)
+            if scan_event.wait(timeout=sleep_time):
+                scan_event.clear()
+                print("Manual scan — skipping the wait.")
 
         except KeyboardInterrupt:
             send_telegram("🔴 <b>Bot stopped.</b>")

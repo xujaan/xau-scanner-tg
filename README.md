@@ -52,6 +52,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Signal Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown that suppresses a repeated setup.
+- **Manual Scan**: Send `/scan` to the bot's Telegram chat to run an immediate scan instead of waiting for the next 5-minute candle close. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
 - **Market-Hour Aware**: Skips the weekend and the daily 17:00–18:00 ET settlement break, evaluated in New York time so DST changes are handled.
 
 ---
