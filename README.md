@@ -56,7 +56,20 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Durable Archive (Turso/libSQL or SQLite)**: Closed candles are stored once per timeframe, every alert with its outcome, and every AI review — so hit rates can be rebuilt after a redeploy instead of resetting. Turso is used when `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set, otherwise a local SQLite file.
 - **Signal Journal**: Every alert is recorded with its SL/TP and later resolved to TP or SL from the candles that follow, giving real hit rates per direction and confidence band instead of guesswork.
 - **AI Second Opinion**: When `OPENROUTER_API_KEY` is set, a second Telegram message carries an LLM review of the rule signal (verdict, confidence, reasons) informed by those hit rates. The AI never changes entry/SL/TP and a failed AI call never blocks the alert.
-- **Manual Scan**: Send `/scan` to the bot's Telegram chat to run an immediate scan instead of waiting for the next 5-minute candle close. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
+- **Telegram Commands**: `/scan` for an immediate scan, plus `/price`, `/status`, `/stats`, `/journal`, `/settings`, `/pause`, `/resume` and `/help`. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
+
+### Telegram commands
+
+| Command | What it does | API cost |
+|---|---|---|
+| `/scan` | Run a scan immediately instead of waiting for the next candle close | 2 requests |
+| `/price` | Current price, 15M bias and 5M RSI | 2 requests |
+| `/status` | Market open/closed, data provider, DB backend, AI state, alerts paused | – |
+| `/stats` | Hit rate overall, per direction, per confidence band, and per AI verdict | – |
+| `/journal` | Last 5 alerts with TP / SL / OPEN outcome | – |
+| `/settings` | Active configuration (provider, cap, cooldown, model) | – |
+| `/pause`, `/resume` | Stop and resume alert sending; scanning continues | – |
+| `/help` | List the commands | – |
 - **Market-Hour Aware**: Skips the weekend and the daily 17:00–18:00 ET settlement break, evaluated in New York time so DST changes are handled.
 
 ---

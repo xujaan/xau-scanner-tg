@@ -532,9 +532,149 @@ def send_photo(photo_path, caption=""):
 # ============================================
 # MANUAL SCAN  (/scan in Telegram)
 # ============================================
+# Shared with the command handlers, which run on the listener thread.
+journal_cache = []
+stats_cache   = None
+alerts_paused = False
+
+def cmd_help():
+    send_telegram(
+        "<b>Commands</b>\n"
+        "/scan — scan now (2 API requests)\n"
+        "/price — price, 15M bias and RSI (2 API requests)\n"
+        "/status — market, alerts, storage and AI state\n"
+        "/stats — hit rate and AI calibration\n"
+        "/journal — last 5 alerts with outcomes\n"
+        "/settings — active configuration\n"
+        "/pause — stop sending alerts\n"
+        "/resume — resume alerts\n"
+        "/help — this list"
+    )
+
+def cmd_status():
+    journal = journal_cache or []
+    st      = stats_cache or journal_stats(journal)
+    rate    = hit_rate({"tp": st["tp"], "sl": st["sl"]})
+    et      = datetime.now(NY)
+    send_telegram(
+        f"📊 <b>Status</b>\n"
+        f"🕐 {datetime.now(IST).strftime('%d %b %H:%M')} IST | {et.strftime('%H:%M')} ET\n"
+        f"🏦 Market: <b>{'closed' if market_closed(et) else 'open'}</b>\n"
+        f"📡 Data: {', '.join(provider_names()) or 'NONE'}\n"
+        f"🗄 DB: {db_backend()}\n"
+        f"🤖 AI: {'on — ' + OPENROUTER_MODEL.split('/')[-1] if AI_ENABLED else 'off'}\n"
+        f"🔔 Alerts: {'paused' if alerts_paused else 'active'}\n"
+        f"🎯 Signals (last {SIGNAL_WINDOW_HOURS:g}h): {len(prune_state(signals_sent))}\n"
+        f"📈 Journal: {st['closed']} closed, {st['open']} open"
+        + (f", {rate}% hit" if rate is not None else "")
+    )
+
+def ai_calibration(journal):
+    """Hit rate per AI verdict — the only honest way to tell if the AI helps."""
+    buckets = {}
+    for rec in journal:
+        if rec.get("outcome") not in ("TP", "SL"):
+            continue
+        key = rec.get("ai_verdict") or "no AI"
+        buckets.setdefault(key, {"tp": 0, "sl": 0})["tp" if rec["outcome"] == "TP" else "sl"] += 1
+    return buckets
+
+def cmd_stats():
+    journal = journal_cache or []
+    st      = stats_cache or journal_stats(journal)
+    if not st["closed"]:
+        send_telegram("📈 <b>Stats</b>\nBelum ada sinyal tertutup — belum ada yang bisa diukur.")
+        return
+    rate  = hit_rate({"tp": st["tp"], "sl": st["sl"]})
+    lines = [f"📈 <b>Stats</b> — {st['closed']} closed",
+             f"✅ TP {st['tp']} | ❌ SL {st['sl']} | hit rate <b>{rate}%</b>"]
+    for name, bucket in sorted(st["by_direction"].items()):
+        total = bucket["tp"] + bucket["sl"]
+        lines.append(f"• {name}: {bucket['tp']}/{total} ({hit_rate(bucket)}%)")
+    for band, bucket in sorted(st["by_band"].items()):
+        total = bucket["tp"] + bucket["sl"]
+        lines.append(f"• conf {band}: {bucket['tp']}/{total} ({hit_rate(bucket)}%)")
+    calibration = ai_calibration(journal)
+    if calibration:
+        lines.append("🤖 <b>AI verdicts:</b>")
+        for verdict, bucket in sorted(calibration.items()):
+            total = bucket["tp"] + bucket["sl"]
+            lines.append(f"• {verdict}: {bucket['tp']}/{total} ({hit_rate(bucket)}%)")
+    send_telegram("\n".join(lines))
+
+def cmd_journal():
+    journal = journal_cache or []
+    if not journal:
+        send_telegram("🗂 <b>Journal</b>\nKosong — belum ada sinyal tercatat.")
+        return
+    icons = {"TP": "✅", "SL": "❌", "OPEN": "⏳"}
+    lines = ["🗂 <b>Last alerts</b>"]
+    for rec in journal[-5:][::-1]:
+        when      = datetime.fromtimestamp(rec["ts"], IST).strftime("%d %b %H:%M")
+        direction = "BUY" if rec.get("direction") in ("BUY", "LONG") else "SELL"
+        ai        = f" | AI {rec['ai_verdict']}" if rec.get("ai_verdict") else ""
+        lines.append(f"{icons.get(rec.get('outcome'), '•')} {when} {direction} "
+                     f"@ {rec.get('entry')} conf {rec.get('confidence')}%{ai}")
+    send_telegram("\n".join(lines))
+
+def cmd_price():
+    send_telegram("🔄 Fetching price...")
+    candles    = get_candles("5min", 60)
+    candles_15 = get_candles("15min", 60)
+    if not candles:
+        send_telegram("❌ Gagal mengambil harga saat ini.")
+        return
+    bias = "n/a"
+    if candles_15:
+        tf_bias, bos_type, _ = analyze_structure_bos(candles_15)
+        bias = f"{tf_bias}{' / ' + bos_type if bos_type else ''}"
+    send_telegram(
+        f"💰 <b>{SYMBOL}</b>: {candles[-1]['close']:.2f}\n"
+        f"📈 15M bias: {bias}\n"
+        f"📉 RSI (5M): {calculate_rsi(candles):.1f}\n"
+        f"🕐 {datetime.now(IST).strftime('%H:%M')} IST | {get_session()}"
+    )
+
+def cmd_settings():
+    cap = ("none" if not QUOTA_ENABLED
+           else f"{MAX_TRADES_PER_DAY} per {SIGNAL_WINDOW_HOURS:g}h")
+    send_telegram(
+        f"⚙️ <b>Settings</b>\n"
+        f"Instrument: {SYMBOL}\n"
+        f"Data: {', '.join(provider_names()) or 'NONE'} (DATA_PROVIDER={DATA_PROVIDER})\n"
+        f"Scan: every 5m | Timeframes: 5M + 15M\n"
+        f"Min confidence: {MIN_CONFIDENCE}%\n"
+        f"Signal cap: {cap}\n"
+        f"Same-direction cooldown: {SAME_DIRECTION_COOLDOWN // 60}m\n"
+        f"Paper mode: {PAPER_MODE}\n"
+        f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
+        f"DB: {db_backend()}"
+    )
+
+def cmd_pause():
+    global alerts_paused
+    alerts_paused = True
+    send_telegram("⏸ <b>Alerts paused</b>\nScanning continues but nothing is sent. /resume to undo.")
+
+def cmd_resume():
+    global alerts_paused
+    alerts_paused = False
+    send_telegram("▶️ <b>Alerts resumed.</b>")
+
+COMMAND_HANDLERS = {
+    "/help":     cmd_help,
+    "/status":   cmd_status,
+    "/stats":    cmd_stats,
+    "/journal":  cmd_journal,
+    "/price":    cmd_price,
+    "/settings": cmd_settings,
+    "/pause":    cmd_pause,
+    "/resume":   cmd_resume,
+}
+
 def handle_command_update(update, scan_event):
-    """Trigger a scan for a /scan command from the configured chat.
-    Returns True when a scan was requested."""
+    """Route a Telegram command from the configured chat. Returns True when a
+    scan was requested."""
     message = update.get("message") or {}
     text    = (message.get("text") or "").strip()
     chat_id = str((message.get("chat") or {}).get("id", ""))
@@ -544,13 +684,24 @@ def handle_command_update(update, scan_event):
     if chat_id != str(TELEGRAM_CHAT_ID):
         print(f"Ignored command from unknown chat {chat_id}")
         return False
-    if text.split("@")[0].lower() != "/scan":
-        return False
 
-    scan_event.set()
-    send_telegram("🔍 <b>Manual scan requested</b>\nScanning now...")
-    print("Manual scan requested via Telegram.")
-    return True
+    command = text.split()[0].split("@")[0].lower()
+    if command == "/scan":
+        scan_event.set()
+        send_telegram("🔍 <b>Manual scan requested</b>\nScanning now...")
+        print("Manual scan requested via Telegram.")
+        return True
+
+    handler = COMMAND_HANDLERS.get(command)
+    if not handler:
+        send_telegram(f"❓ Unknown command: <code>{command}</code>\nSend /help.")
+        return False
+    try:
+        handler()
+    except Exception as e:
+        print(f"Command {command} failed: {e}")
+        send_telegram(f"❌ {command} failed: {e}")
+    return False
 
 def command_listener(scan_event):
     """Poll Telegram for /scan while the main loop runs on this thread."""
@@ -1286,7 +1437,7 @@ def market_closed(now=None):
 # MAIN LOOP
 # ============================================
 def main():
-    global signals_sent
+    global signals_sent, journal_cache, stats_cache
 
     signals_sent = load_state()
 
@@ -1312,6 +1463,7 @@ def main():
             journal = legacy
             print("Journal: DB empty or unavailable — continuing from the JSON journal.")
     print(f"Journal: {len(journal)} signals loaded")
+    journal_cache, stats_cache = journal, journal_stats(journal)
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
     scan_event = threading.Event()
@@ -1374,13 +1526,16 @@ def main():
             stats   = journal_stats(journal)
             db_save_bars(candles_5m, "5min")
             db_save_bars(candles_15m, "15min")
+            journal_cache, stats_cache = journal, stats
 
             sig = generate_signal(candles_5m, candles_15m)
 
             if sig:
                 now_ts = time.time()
                 last   = signals_sent[-1] if signals_sent else None
-                if (last and last["direction"] == sig["signal"] and
+                if alerts_paused:
+                    print(f"⏸ Paused — {sig['signal']} @ {sig['price']} not sent.")
+                elif (last and last["direction"] == sig["signal"] and
                         now_ts - last["ts"] < SAME_DIRECTION_COOLDOWN):
                     print("Same direction within 45min — skipping.")
                 elif QUOTA_ENABLED and remaining <= 0:
