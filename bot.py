@@ -27,6 +27,15 @@ OANDA_ACCOUNT_ID  = os.environ.get("OANDA_ACCOUNT_ID")
 OANDA_ENV         = os.environ.get("OANDA_ENV", "practice").strip().lower()
 OANDA_INSTRUMENT  = os.environ.get("OANDA_INSTRUMENT", "XAU_USD")
 
+# AI second opinion via OpenRouter. Off unless OPENROUTER_API_KEY is set, and it can
+# never replace or alter the rule-based plan — it only annotates it.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_MODEL   = os.environ.get("OPENROUTER_MODEL", "deepseek/deepseek-v4.1-flash-1017")
+AI_ENABLED         = bool(OPENROUTER_API_KEY)
+AI_TIMEOUT         = int(os.environ.get("AI_TIMEOUT", 20))
+JOURNAL_FILE       = os.environ.get("JOURNAL_FILE", "signal_journal.json")
+JOURNAL_MAX        = 200
+
 SYMBOL       = "XAU/USD"
 CAPITAL      = 200
 RISK_PERCENT = 0.05
@@ -69,7 +78,7 @@ def load_state():
         history = []
         for item in raw.get("signals", []):
             direction = str(item["direction"])
-            if direction in ("BUY", "SELL"):
+            if direction in ("BUY", "SELL", "LONG", "SHORT"):
                 history.append({"ts": float(item["ts"]), "direction": direction})
         history.sort(key=lambda s: s["ts"])
         return prune_state(history)
@@ -101,6 +110,250 @@ def format_wait(history, now_ts=None):
         return "now"
     wait = int(history[0]["ts"] + SIGNAL_WINDOW - now_ts)
     return "now" if wait <= 0 else f"{wait // 3600}h {(wait % 3600) // 60}m"
+
+# ============================================
+# SIGNAL JOURNAL  (every alert, and how it resolved)
+# ============================================
+def load_journal():
+    """Alerts sent so far. Missing or corrupt file = empty journal."""
+    try:
+        with open(JOURNAL_FILE, "r") as fh:
+            raw = json.load(fh)
+        return [r for r in raw.get("signals", [])
+                if r.get("direction") in ("BUY", "SELL", "LONG", "SHORT")]
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"Journal load error ({JOURNAL_FILE}): {e} — starting empty.")
+        return []
+
+def save_journal(journal):
+    tmp = f"{JOURNAL_FILE}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"signals": journal[-JOURNAL_MAX:]}, fh)
+        os.replace(tmp, JOURNAL_FILE)
+    except Exception as e:
+        print(f"Journal save error ({JOURNAL_FILE}): {e}")
+
+def plan_prices(sig):
+    """The exact SL/TP quoted in the alert."""
+    if sig["signal"] == "LONG":
+        return (round(sig["price"] - sig["sl_dollars"], 2),
+                round(sig["price"] + sig["tp_dollars"], 2))
+    return (round(sig["price"] + sig["sl_dollars"], 2),
+            round(sig["price"] - sig["tp_dollars"], 2))
+
+def record_signal(journal, sig, opinion=None):
+    sl, tp = plan_prices(sig)
+    journal.append({
+        "ts": time.time(), "direction": sig["signal"], "entry": sig["price"],
+        "sl": sl, "tp": tp, "confidence": sig["confidence"],
+        "outcome": "OPEN", "closed_ts": None, "last_bar": None,
+        "ai_verdict": (opinion or {}).get("verdict"),
+        "ai_confidence": (opinion or {}).get("confidence"),
+    })
+    save_journal(journal)
+    return journal
+
+def evaluate_journal(journal, candles):
+    """Resolve OPEN records by walking only the bars that printed after they were sent.
+    A bar that touches both levels is counted as a loss."""
+    if not candles:
+        return journal
+    changed = False
+    for rec in journal:
+        if rec.get("outcome") != "OPEN":
+            continue
+        last = rec.get("last_bar")
+        for c in candles:
+            if last is not None and c["time"] <= last:
+                continue
+            last = c["time"]
+            if rec["direction"] in ("BUY", "LONG"):
+                if c["low"] <= rec["sl"]:
+                    rec["outcome"] = "SL"
+                elif c["high"] >= rec["tp"]:
+                    rec["outcome"] = "TP"
+            else:
+                if c["high"] >= rec["sl"]:
+                    rec["outcome"] = "SL"
+                elif c["low"] <= rec["tp"]:
+                    rec["outcome"] = "TP"
+            if rec["outcome"] != "OPEN":
+                rec["closed_ts"] = time.time()
+                break
+        rec["last_bar"] = last
+        changed = True
+    if changed:
+        save_journal(journal)
+    return journal
+
+def score_band(confidence):
+    if confidence >= 85:
+        return "85+"
+    if confidence >= 75:
+        return "75-84"
+    return "65-74"
+
+def hit_rate(bucket):
+    total = bucket["tp"] + bucket["sl"]
+    return None if not total else round(100 * bucket["tp"] / total)
+
+def journal_stats(journal, recent=8):
+    """Hit rates the AI is given as context, so 'learning' means data, not vibes."""
+    stats = {"closed": 0, "tp": 0, "sl": 0, "open": 0,
+             "by_direction": {}, "by_band": {}, "recent": []}
+    closed = []
+    for rec in journal:
+        if rec.get("outcome") == "OPEN":
+            stats["open"] += 1
+            continue
+        if rec.get("outcome") not in ("TP", "SL"):
+            continue
+        closed.append(rec)
+        stats["closed"] += 1
+        won = rec["outcome"] == "TP"
+        stats["tp" if won else "sl"] += 1
+        direction = "BUY" if rec.get("direction") in ("BUY", "LONG") else "SELL"
+        for table, key in ((stats["by_direction"], direction),
+                           (stats["by_band"], score_band(rec.get("confidence") or 0))):
+            table.setdefault(key, {"tp": 0, "sl": 0})["tp" if won else "sl"] += 1
+    for rec in closed[-recent:]:
+        direction = "BUY" if rec.get("direction") in ("BUY", "LONG") else "SELL"
+        stats["recent"].append(f"{direction} {rec.get('confidence')}% -> {rec['outcome']}")
+    return stats
+
+# ============================================
+# AI SECOND OPINION  (OpenRouter, advisory only)
+# ============================================
+AI_SYSTEM_PROMPT = (
+    "You are a strict risk reviewer for a gold (XAU/USD) SMC signal bot. "
+    "You cannot see charts and cannot predict price; never claim to know what "
+    "price will do. Judge only whether this setup is internally consistent and "
+    "worth taking, using the structure, the confluence list, and the historical "
+    "hit rates provided. Weigh the journal: a low hit rate in the same direction "
+    "or confidence band is evidence against the trade. Do not invent levels or "
+    "confluences that are not in the input. Reply with JSON only."
+)
+
+AI_OPINION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdict", "confidence", "reasons", "risk_note"],
+    "properties": {
+        "verdict": {"type": "string", "enum": ["AGREE", "CAUTION", "REJECT"]},
+        "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+        "reasons": {"type": "array", "items": {"type": "string"}, "maxItems": 3},
+        "risk_note": {"type": "string"},
+    },
+}
+
+def ai_second_opinion(sig, candles_5m, candles_15m, stats):
+    """Ask the model to review the rule signal. Returns None on any failure —
+    the alert has already been sent, so the AI must never block it."""
+    if not AI_ENABLED or not sig:
+        return None
+
+    def bars(candles, count):
+        return [[round(c["open"], 2), round(c["high"], 2),
+                 round(c["low"], 2), round(c["close"], 2)]
+                for c in candles[-count:]]
+
+    sl, tp = plan_prices(sig)
+    payload = {
+        "instrument": "XAU/USD",
+        "rule_signal": {
+            "direction": "BUY" if sig["signal"] == "LONG" else "SELL",
+            "entry": sig["price"], "stop_loss": sl, "take_profit": tp,
+            "confidence": sig["confidence"], "risk_reward": "1:2",
+            "rsi": sig["rsi"], "tf15_bias": sig["tf_bias"],
+            "bos": sig["bos_type"], "choch": sig["choch"],
+            "order_block": {"high": sig["ob_high"], "low": sig["ob_low"],
+                            "price_inside": sig["price_in_ob"]},
+            "liquidity": {"equal_highs": sig["eq_highs"], "equal_lows": sig["eq_lows"],
+                          "swept_high": sig["swept_high"], "swept_low": sig["swept_low"],
+                          "grab": sig["liquidity"]},
+            "fvg": sig["fvg"], "pattern": sig["pattern"],
+            "confluences": sig["reasons"],
+        },
+        "recent_bars_5m_ohlc": bars(candles_5m, 20),
+        "recent_bars_15m_ohlc": bars(candles_15m, 12),
+        "journal": {
+            "closed_signals": stats["closed"],
+            "take_profit": stats["tp"], "stop_loss": stats["sl"],
+            "hit_rate_pct": hit_rate({"tp": stats["tp"], "sl": stats["sl"]}),
+            "hit_rate_by_direction": {k: hit_rate(v) for k, v in stats["by_direction"].items()},
+            "hit_rate_by_confidence_band": {k: hit_rate(v) for k, v in stats["by_band"].items()},
+            "recent_outcomes": stats["recent"],
+        },
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT},
+                     {"role": "user", "content": json.dumps(payload)}],
+        "temperature": 0.2,
+        "max_tokens": 400,
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "signal_opinion", "strict": True, "schema": AI_OPINION_SCHEMA}},
+    }
+    try:
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                                   "Content-Type": "application/json"},
+                          json=body, timeout=AI_TIMEOUT)
+        if r.status_code != 200:
+            print(f"AI error {r.status_code}: {r.text[:200]}")
+            return None
+        content = r.json()["choices"][0]["message"]["content"]
+        opinion = json.loads(content)
+    except Exception as e:
+        print(f"AI call failed: {e}")
+        return None
+    return validate_opinion(opinion)
+
+def validate_opinion(opinion):
+    """Schema-valid JSON can still be nonsense, so check the values that matter."""
+    if not isinstance(opinion, dict):
+        return None
+    verdict = str(opinion.get("verdict", "")).upper()
+    if verdict not in ("AGREE", "CAUTION", "REJECT"):
+        print(f"AI opinion discarded — unknown verdict {verdict!r}")
+        return None
+    try:
+        confidence = int(opinion.get("confidence"))
+    except (TypeError, ValueError):
+        print("AI opinion discarded — confidence is not a number")
+        return None
+    if not 0 <= confidence <= 100:
+        print(f"AI opinion discarded — confidence {confidence} out of range")
+        return None
+    reasons = [str(x).strip() for x in (opinion.get("reasons") or []) if str(x).strip()][:3]
+    return {"verdict": verdict, "confidence": confidence, "reasons": reasons,
+            "risk_note": str(opinion.get("risk_note") or "").strip()[:300]}
+
+def send_ai_opinion(sig, opinion, stats):
+    icons    = {"AGREE": "✅", "CAUTION": "⚠️", "REJECT": "⛔"}
+    direction = "BUY" if sig["signal"] == "LONG" else "SELL"
+    lines = [
+        f"🤖 <b>AI Second Opinion</b> <i>({OPENROUTER_MODEL.split('/')[-1]})</i>",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Rule signal: <b>{direction}</b> @ {sig['price']:.2f} | rule conf {sig['confidence']}%",
+        f"{icons.get(opinion['verdict'], 'ℹ️')} Verdict: <b>{opinion['verdict']}</b> ({opinion['confidence']}%)",
+    ]
+    if opinion["reasons"]:
+        lines.append("📝 <b>Reasons:</b>")
+        lines.extend(f"  • {r}" for r in opinion["reasons"])
+    if opinion["risk_note"]:
+        lines.append(f"⚠️ <b>Risk:</b> {opinion['risk_note']}")
+    if stats["closed"]:
+        rate = hit_rate({"tp": stats["tp"], "sl": stats["sl"]})
+        lines.append(f"📈 <b>Journal:</b> {stats['closed']} closed — "
+                     f"{stats['tp']} TP / {stats['sl']} SL ({rate}% hit)")
+    else:
+        lines.append("📈 <b>Journal:</b> no closed signals yet — no hit-rate context.")
+    lines.append("\n<i>AI cannot change entry/SL/TP. Second opinion, not an order.</i>")
+    send_telegram("\n".join(lines))
 
 # ============================================
 # TELEGRAM
@@ -899,6 +1152,10 @@ def main():
                   else f"no cap ({SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown)")
     print(f"Quota: {quota_line} | {len(signals_sent)} loaded from {STATE_FILE}")
 
+    journal = load_journal()
+    print(f"Journal: {len(journal)} signals from {JOURNAL_FILE}")
+    print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
+
     scan_event = threading.Event()
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         threading.Thread(target=command_listener, args=(scan_event,), daemon=True).start()
@@ -955,6 +1212,9 @@ def main():
                 time.sleep(120)
                 continue
 
+            journal = evaluate_journal(journal, candles_5m)
+            stats   = journal_stats(journal)
+
             sig = generate_signal(candles_5m, candles_15m)
 
             if sig:
@@ -970,6 +1230,10 @@ def main():
                           f"{format_wait(signals_sent, now_ts)}")
                 else:
                     send_signal(sig, candles_5m)
+                    opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
+                    if opinion:
+                        send_ai_opinion(sig, opinion, stats)
+                    journal = record_signal(journal, sig, opinion)
                     signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
                     save_state(signals_sent)
                     if QUOTA_ENABLED:

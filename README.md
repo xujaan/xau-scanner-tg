@@ -53,6 +53,8 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Signal Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown that suppresses a repeated setup.
 - **TwelveData by Default**: Candles come from TwelveData. An OANDA v20 practice account is supported but stays switched off until you explicitly enable it with `DATA_PROVIDER=oanda`.
+- **Signal Journal**: Every alert is recorded with its SL/TP and later resolved to TP or SL from the candles that follow, giving real hit rates per direction and confidence band instead of guesswork.
+- **AI Second Opinion**: When `OPENROUTER_API_KEY` is set, a second Telegram message carries an LLM review of the rule signal (verdict, confidence, reasons) informed by those hit rates. The AI never changes entry/SL/TP and a failed AI call never blocks the alert.
 - **Manual Scan**: Send `/scan` to the bot's Telegram chat to run an immediate scan instead of waiting for the next 5-minute candle close. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
 - **Market-Hour Aware**: Skips the weekend and the daily 17:00–18:00 ET settlement break, evaluated in New York time so DST changes are handled.
 
@@ -118,6 +120,10 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `MAX_TRADES_PER_DAY` | Optional. Max signals in any rolling window; `0` (default) = unlimited. |
 | `SIGNAL_WINDOW_HOURS` | Optional. Rolling window length in hours, used only when a cap is set (default `24`). |
 | `STATE_FILE` | Optional. File used to persist signal history (default `signal_state.json`). |
+| `OPENROUTER_API_KEY` | Optional. Enables the AI second opinion. Without it the AI layer stays off. |
+| `OPENROUTER_MODEL` | Optional. Default `deepseek/deepseek-v4.1-flash-1017`. Pin a dated snapshot ID. |
+| `AI_TIMEOUT` | Optional. Seconds before the AI call is abandoned (default `20`). |
+| `JOURNAL_FILE` | Optional. Where sent signals and their outcomes are stored (default `signal_journal.json`). |
 
 ---
 

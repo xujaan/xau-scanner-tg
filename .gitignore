@@ -224,3 +224,5 @@ k8s/secret.yaml
 # Runtime signal-quota state (rolling window history)
 signal_state.json
 signal_state.json.tmp
+signal_journal.json
+signal_journal.json.tmp
