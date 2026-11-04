@@ -52,7 +52,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Signal Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown that suppresses a repeated setup.
-- **Dual Data Providers**: OANDA v20 (free practice account) is tried first, with TwelveData as an automatic fallback, so one provider failing or throttling does not blind the bot.
+- **TwelveData by Default**: Candles come from TwelveData. An OANDA v20 practice account is supported but stays switched off until you explicitly enable it with `DATA_PROVIDER=oanda`.
 - **Manual Scan**: Send `/scan` to the bot's Telegram chat to run an immediate scan instead of waiting for the next 5-minute candle close. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
 - **Market-Hour Aware**: Skips the weekend and the daily 17:00–18:00 ET settlement break, evaluated in New York time so DST changes are handled.
 
@@ -110,8 +110,9 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `TELEGRAM_TOKEN` | The HTTP API token from BotFather. |
 | `TELEGRAM_CHAT_ID` | Your personal ID or Channel ID where signals will be sent. |
 | `TWELVEDATA_API_KEY` | Free API key from TwelveData to pull candlestick data. Used as a fallback. |
-| `OANDA_API_KEY` | Optional. Personal access token from a **practice** account at OANDA. Preferred provider. |
-| `OANDA_ACCOUNT_ID` | Optional. The v20 account ID that goes with `OANDA_API_KEY`. |
+| `DATA_PROVIDER` | Optional. `twelvedata` (default) or `oanda`. OANDA is never called unless this is set to `oanda`. |
+| `OANDA_API_KEY` | Optional. Personal access token from a **practice** account at OANDA. Only used with `DATA_PROVIDER=oanda`. |
+| `OANDA_ACCOUNT_ID` | Optional. The v20 account ID that goes with `OANDA_API_KEY`. Only used with `DATA_PROVIDER=oanda`. |
 | `OANDA_ENV` | Optional. `practice` (default) or `live`; selects the OANDA host. |
 | `OANDA_INSTRUMENT` | Optional. Instrument to pull, default `XAU_USD`. |
 | `MAX_TRADES_PER_DAY` | Optional. Max signals in any rolling window; `0` (default) = unlimited. |

@@ -19,8 +19,9 @@ TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 
-# Preferred provider: OANDA v20 (free practice account, M5/M15 candles, no published
-# daily cap). TwelveData is used as the fallback when OANDA is not configured or fails.
+# TwelveData is the data source. OANDA v20 support is opt-in and inert until
+# DATA_PROVIDER=oanda is set, so no OANDA request is ever made by default.
+DATA_PROVIDER     = os.environ.get("DATA_PROVIDER", "twelvedata").strip().lower()
 OANDA_API_KEY     = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID  = os.environ.get("OANDA_ACCOUNT_ID")
 OANDA_ENV         = os.environ.get("OANDA_ENV", "practice").strip().lower()
@@ -189,7 +190,7 @@ OANDA_GRANULARITY = {"1min": "M1", "5min": "M5", "15min": "M15",
 def provider_names():
     """Configured providers, in the order they are tried."""
     names = []
-    if OANDA_API_KEY and OANDA_ACCOUNT_ID:
+    if DATA_PROVIDER == "oanda" and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         names.append(f"OANDA {OANDA_INSTRUMENT} ({OANDA_ENV})")
     if TWELVEDATA_API_KEY:
         names.append("TwelveData")
@@ -251,7 +252,7 @@ def get_candles_twelvedata(interval="5min", outputsize=100):
 def get_candles(interval="5min", outputsize=100):
     """Ask each configured provider in turn and return the first usable series."""
     providers = []
-    if OANDA_API_KEY and OANDA_ACCOUNT_ID:
+    if DATA_PROVIDER == "oanda" and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         providers.append(("OANDA", get_candles_oanda))
     if TWELVEDATA_API_KEY:
         providers.append(("TwelveData", get_candles_twelvedata))
