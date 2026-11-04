@@ -51,6 +51,8 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Capital Adequacy Checks**: Gold is volatile. The bot mathematically verifies if your account balance can handle the minimum lot size for a specific setup's stop-loss. If the risk is too high, it dynamically rejects the trade.
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
+- **Rolling Signal Quota**: Sends at most N alerts per rolling window while continuing to scan, so a strong setup is never missed just because the calendar day flipped.
+- **Market-Hour Aware**: Skips the weekend and the daily 17:00–18:00 ET settlement break, evaluated in New York time so DST changes are handled.
 
 ---
 
@@ -79,9 +81,15 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
    ```python
    CAPITAL = 100               # Your exact real balance
    RISK_PERCENT = 0.03         # 3% risk per trade
-   MAX_TRADES_PER_DAY = 2      # Quality over quantity
    MIN_CONFIDENCE = 80         # Strict 80%+ confluence required
    PAPER_MODE = True           # Set False ONLY when ready for live execution
+   ```
+
+   The signal quota is a **rolling window**, not a calendar-day counter — a slot frees up the moment the oldest signal ages out of the window, and the history is persisted so a restart does not refill it. Override these with environment variables (defaults shown):
+   ```python
+   MAX_TRADES_PER_DAY = 3                       # max signals in any rolling window
+   SIGNAL_WINDOW_HOURS = 24                     # window length in hours
+   STATE_FILE = "signal_state.json"             # persisted history, survives restarts
    ```
 
 4. **Run the bot:**
@@ -100,6 +108,9 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `TELEGRAM_TOKEN` | The HTTP API token from BotFather. |
 | `TELEGRAM_CHAT_ID` | Your personal ID or Channel ID where signals will be sent. |
 | `TWELVEDATA_API_KEY` | Free API key from TwelveData to pull candlestick data. |
+| `MAX_TRADES_PER_DAY` | Optional. Max signals in any rolling window (default `3`). |
+| `SIGNAL_WINDOW_HOURS` | Optional. Rolling window length in hours (default `24`). |
+| `STATE_FILE` | Optional. File used to persist signal history (default `signal_state.json`). |
 
 ---
 

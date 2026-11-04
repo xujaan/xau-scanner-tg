@@ -1,7 +1,8 @@
+import json
 import os
 import requests
 import time
-from datetime import datetime, date
+from datetime import datetime
 import pytz
 try:
     from chart import build_signal_chart
@@ -22,13 +23,21 @@ CAPITAL      = 200
 RISK_PERCENT = 0.05
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $10
 
-MAX_TRADES_PER_DAY = 3
+# Rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS window.
+# No midnight reset — a slot frees up exactly when the oldest signal leaves the window.
+MAX_TRADES_PER_DAY      = int(os.environ.get("MAX_TRADES_PER_DAY", 3))
+SIGNAL_WINDOW_HOURS     = float(os.environ.get("SIGNAL_WINDOW_HOURS", 24))
+SIGNAL_WINDOW           = int(SIGNAL_WINDOW_HOURS * 3600)
+SAME_DIRECTION_COOLDOWN = 2700   # seconds — ignore a repeat signal in the same direction
+STATE_FILE              = os.environ.get("STATE_FILE", "signal_state.json")
+
 MIN_CONFIDENCE     = 65
 MIN_SL_DOLLARS     = 3.0
 MAX_SL_DOLLARS     = 20.0
 MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
 EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
 IST                = pytz.timezone('Asia/Kolkata')
+NY                 = pytz.timezone('America/New_York')
 
 PAPER_MODE = True
 
@@ -36,12 +45,51 @@ PAPER_MODE = True
 USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0
 
 # ============================================
-# STATE
+# STATE  (rolling window, persisted to disk)
 # ============================================
-trades_today          = 0
-last_trade_date       = None
-last_signal_direction = None
-last_signal_time      = 0
+# List of {"ts": epoch, "direction": "BUY"|"SELL"}, oldest first.
+signals_sent = []
+
+def load_state():
+    """Read signal history from disk. Missing or corrupt file = empty history."""
+    try:
+        with open(STATE_FILE, "r") as fh:
+            raw = json.load(fh)
+        history = []
+        for item in raw.get("signals", []):
+            direction = str(item["direction"])
+            if direction in ("BUY", "SELL"):
+                history.append({"ts": float(item["ts"]), "direction": direction})
+        history.sort(key=lambda s: s["ts"])
+        return prune_state(history)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"State load error ({STATE_FILE}): {e} — starting empty.")
+        return []
+
+def save_state(history):
+    """Best-effort atomic write; a disk problem must not stop the bot."""
+    tmp = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"signals": history}, fh)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print(f"State save error ({STATE_FILE}): {e}")
+
+def prune_state(history, now_ts=None):
+    """Drop signals that have left the rolling window."""
+    now_ts = time.time() if now_ts is None else now_ts
+    return [s for s in history if now_ts - s["ts"] < SIGNAL_WINDOW]
+
+def format_wait(history, now_ts=None):
+    """Time until the oldest signal leaves the window and a slot frees up."""
+    now_ts = time.time() if now_ts is None else now_ts
+    if not history:
+        return "now"
+    wait = int(history[0]["ts"] + SIGNAL_WINDOW - now_ts)
+    return "now" if wait <= 0 else f"{wait // 3600}h {(wait % 3600) // 60}m"
 
 # ============================================
 # TELEGRAM
@@ -668,7 +716,7 @@ def send_signal(sig, candles=None):
 📉 <b>RSI:</b> {sig["rsi"]}
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now_ist}
-⚠️ <i>Max {MAX_TRADES_PER_DAY} signals/day. Verify spread before acting.</i>"""
+⚠️ <i>Max {MAX_TRADES_PER_DAY} signals per {SIGNAL_WINDOW_HOURS:g}h. Verify spread before acting.</i>"""
 
     send_telegram(msg)
     if chart_path:
@@ -690,15 +738,34 @@ def get_session():
     return "Off Hours 🌙"
 
 # ============================================
+# MARKET HOURS
+# ============================================
+def market_closed(now=None):
+    """XAU/USD spot trades Sun 18:00 ET to Fri 17:00 ET, with a daily
+    17:00-18:00 ET settlement break. Checked in ET so DST is handled."""
+    n = (now or datetime.now(NY)).astimezone(NY)
+    if n.weekday() == 4 and n.hour >= 17:   # Friday, after the close
+        return True
+    if n.weekday() == 5:                    # Saturday
+        return True
+    if n.weekday() == 6 and n.hour < 18:    # Sunday, before the open
+        return True
+    return n.hour == 17                     # daily settlement break
+
+# ============================================
 # MAIN LOOP
 # ============================================
 def main():
-    global trades_today, last_trade_date, last_signal_direction, last_signal_time
+    global signals_sent
+
+    signals_sent = load_state()
 
     print("🚀 XAUUSD SMC Bot Starting...")
     print(f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f} | "
           f"Min Confidence: {MIN_CONFIDENCE}%")
     print(f"Paper mode: {PAPER_MODE}")
+    print(f"Quota: {MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling) | "
+          f"{len(signals_sent)} loaded from {STATE_FILE}")
 
     send_telegram(
         f"🚀 <b>XAUUSD SMC Bot LIVE</b>\n\n"
@@ -707,35 +774,27 @@ def main():
         f"+ Liquidity Zones + FVG + Patterns + RSI\n\n"
         f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
         f"Min Confidence: {MIN_CONFIDENCE}%\n"
-        f"Max Signals/Day: {MAX_TRADES_PER_DAY}\n"
+        f"Max Signals: {MAX_TRADES_PER_DAY} per {SIGNAL_WINDOW_HOURS:g}h (rolling)\n"
         f"Timeframes: 5M + 15M\n\n"
         f"Scanning every 5 minutes ⚔️"
     )
 
     while True:
         try:
-            now   = datetime.now(IST)
-            today = date.today()
-
-            if last_trade_date != today:
-                trades_today = 0
-                last_trade_date = today
-                last_signal_direction = None
-                print(f"\n📅 New day: {today}")
-                send_telegram(f"📅 <b>New Day: {today}</b>\nSignals remaining: {MAX_TRADES_PER_DAY}")
+            now = datetime.now(IST)
+            signals_sent = prune_state(signals_sent)
+            used      = len(signals_sent)
+            remaining = max(0, MAX_TRADES_PER_DAY - used)
 
             session = get_session()
-            print(f"\n[{now.strftime('%H:%M')}] {session} | "
-                  f"Signals: {trades_today}/{MAX_TRADES_PER_DAY}")
+            print(f"\n[{now.strftime('%H:%M')} IST] {session} | "
+                  f"Signals (last {SIGNAL_WINDOW_HOURS:g}h): {used}/{MAX_TRADES_PER_DAY}")
 
-            if trades_today >= MAX_TRADES_PER_DAY:
-                print("Daily limit reached. Sleeping 1hr...")
-                time.sleep(3600)
-                continue
-
-            if now.weekday() >= 5:
-                print("Weekend. Sleeping 1hr...")
-                time.sleep(3600)
+            # The quota limits alerts, never the scan — setups we cannot send
+            # are still logged so nothing is silently missed.
+            if market_closed():
+                print("Market closed. Sleeping 15min...")
+                time.sleep(900)
                 continue
 
             print("Fetching candles...")
@@ -752,19 +811,27 @@ def main():
 
             if sig:
                 now_ts = time.time()
-                if (last_signal_direction == sig["signal"] and
-                        now_ts - last_signal_time < 2700):
+                last   = signals_sent[-1] if signals_sent else None
+                if (last and last["direction"] == sig["signal"] and
+                        now_ts - last["ts"] < SAME_DIRECTION_COOLDOWN):
                     print("Same direction within 45min — skipping.")
+                elif remaining <= 0:
+                    print(f"⏭ Skipped (quota {used}/{MAX_TRADES_PER_DAY}): "
+                          f"{sig['signal']} @ {sig['price']} | "
+                          f"conf {sig['confidence']}% | next slot in "
+                          f"{format_wait(signals_sent, now_ts)}")
                 else:
                     send_signal(sig, candles_5m)
-                    trades_today         += 1
-                    last_signal_time      = now_ts
-                    last_signal_direction = sig["signal"]
-                    if trades_today >= MAX_TRADES_PER_DAY:
+                    signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
+                    save_state(signals_sent)
+                    remaining -= 1
+                    if remaining == 0:
                         send_telegram(
-                            f"🔴 <b>Daily Limit Reached</b>\n"
-                            f"{MAX_TRADES_PER_DAY}/{MAX_TRADES_PER_DAY} signals sent.\n"
-                            f"Resuming tomorrow."
+                            f"🔴 <b>Signal Quota Reached</b>\n"
+                            f"{MAX_TRADES_PER_DAY} signals in the last "
+                            f"{SIGNAL_WINDOW_HOURS:g}h.\n"
+                            f"Still scanning — next alert in "
+                            f"{format_wait(signals_sent)}."
                         )
             else:
                 print("No signal. Waiting...")

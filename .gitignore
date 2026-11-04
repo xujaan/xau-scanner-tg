@@ -220,3 +220,7 @@ bot.log
 bot.pid
 *.bak
 k8s/secret.yaml
+
+# Runtime signal-quota state (rolling window history)
+signal_state.json
+signal_state.json.tmp
