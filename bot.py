@@ -19,6 +19,13 @@ TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 
+# Preferred provider: OANDA v20 (free practice account, M5/M15 candles, no published
+# daily cap). TwelveData is used as the fallback when OANDA is not configured or fails.
+OANDA_API_KEY     = os.environ.get("OANDA_API_KEY")
+OANDA_ACCOUNT_ID  = os.environ.get("OANDA_ACCOUNT_ID")
+OANDA_ENV         = os.environ.get("OANDA_ENV", "practice").strip().lower()
+OANDA_INSTRUMENT  = os.environ.get("OANDA_INSTRUMENT", "XAU_USD")
+
 SYMBOL       = "XAU/USD"
 CAPITAL      = 200
 RISK_PERCENT = 0.05
@@ -174,7 +181,50 @@ def command_listener(scan_event):
 # ============================================
 # FETCH CANDLES
 # ============================================
-def get_candles(interval="5min", outputsize=100):
+OANDA_HOST = ("https://api-fxlive.oanda.com" if OANDA_ENV == "live"
+              else "https://api-fxpractice.oanda.com")
+OANDA_GRANULARITY = {"1min": "M1", "5min": "M5", "15min": "M15",
+                     "30min": "M30", "1h": "H1", "4h": "H4", "1day": "D"}
+
+def provider_names():
+    """Configured providers, in the order they are tried."""
+    names = []
+    if OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        names.append(f"OANDA {OANDA_INSTRUMENT} ({OANDA_ENV})")
+    if TWELVEDATA_API_KEY:
+        names.append("TwelveData")
+    return names
+
+def get_candles_oanda(interval="5min", outputsize=100):
+    """Mid-price candles from OANDA v20. Incomplete (still forming) bars are dropped."""
+    granularity = OANDA_GRANULARITY.get(interval)
+    if not granularity:
+        print(f"OANDA: unsupported interval {interval}")
+        return None
+    url     = f"{OANDA_HOST}/v3/instruments/{OANDA_INSTRUMENT}/candles"
+    params  = {"granularity": granularity, "count": outputsize, "price": "M"}
+    headers = {"Authorization": f"Bearer {OANDA_API_KEY}"}
+    try:
+        r    = requests.get(url, params=params, headers=headers, timeout=15)
+        data = r.json()
+        if "candles" not in data:
+            print(f"OANDA API Error: {data}")
+            return None
+        candles = []
+        for c in data["candles"]:
+            if not c.get("complete", True):
+                continue
+            mid = c["mid"]
+            candles.append({
+                "time": c["time"], "open": float(mid["o"]), "high": float(mid["h"]),
+                "low": float(mid["l"]), "close": float(mid["c"])
+            })
+        return candles or None
+    except Exception as e:
+        print(f"OANDA fetch error: {e}")
+        return None
+
+def get_candles_twelvedata(interval="5min", outputsize=100):
     url    = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL, "interval": interval,
@@ -197,6 +247,26 @@ def get_candles(interval="5min", outputsize=100):
     except Exception as e:
         print(f"Candle fetch error: {e}")
         return None
+
+def get_candles(interval="5min", outputsize=100):
+    """Ask each configured provider in turn and return the first usable series."""
+    providers = []
+    if OANDA_API_KEY and OANDA_ACCOUNT_ID:
+        providers.append(("OANDA", get_candles_oanda))
+    if TWELVEDATA_API_KEY:
+        providers.append(("TwelveData", get_candles_twelvedata))
+
+    if not providers:
+        print("No market data provider configured "
+              "(set OANDA_API_KEY + OANDA_ACCOUNT_ID, or TWELVEDATA_API_KEY).")
+        return None
+
+    for name, fetch in providers:
+        candles = fetch(interval, outputsize)
+        if candles:
+            return candles
+        print(f"{name} returned no candles — trying the next provider.")
+    return None
 
 # ============================================
 # SWING HIGH / LOW DETECTION
@@ -822,6 +892,7 @@ def main():
     print(f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f} | "
           f"Min Confidence: {MIN_CONFIDENCE}%")
     print(f"Paper mode: {PAPER_MODE}")
+    print(f"Data: {', '.join(provider_names()) or 'NONE configured'}")
     quota_line = (f"{MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling)"
                   if QUOTA_ENABLED
                   else f"no cap ({SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown)")
