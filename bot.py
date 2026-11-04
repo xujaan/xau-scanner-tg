@@ -23,9 +23,11 @@ CAPITAL      = 200
 RISK_PERCENT = 0.05
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $10
 
-# Rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS window.
-# No midnight reset — a slot frees up exactly when the oldest signal leaves the window.
-MAX_TRADES_PER_DAY      = int(os.environ.get("MAX_TRADES_PER_DAY", 3))
+# Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
+# window. 0 (the default) means no cap at all — the same-direction cooldown below is
+# then the only throttle. No midnight reset either way.
+MAX_TRADES_PER_DAY      = int(os.environ.get("MAX_TRADES_PER_DAY", 0))
+QUOTA_ENABLED           = MAX_TRADES_PER_DAY > 0
 SIGNAL_WINDOW_HOURS     = float(os.environ.get("SIGNAL_WINDOW_HOURS", 24))
 SIGNAL_WINDOW           = int(SIGNAL_WINDOW_HOURS * 3600)
 SAME_DIRECTION_COOLDOWN = 2700   # seconds — ignore a repeat signal in the same direction
@@ -696,6 +698,10 @@ def send_signal(sig, candles=None):
     elif sig["swept_low"]:
         liq_text = "💧 <b>Liquidity:</b> Equal Lows swept (stop hunt confirmed)\n"
 
+    quota_note = (f"Max {MAX_TRADES_PER_DAY} signals per {SIGNAL_WINDOW_HOURS:g}h"
+                  if QUOTA_ENABLED
+                  else f"{SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown only")
+
     msg = f"""{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>Direction:</b> {direction}
@@ -716,7 +722,7 @@ def send_signal(sig, candles=None):
 📉 <b>RSI:</b> {sig["rsi"]}
 ━━━━━━━━━━━━━━━━━━━━
 🕐 {now_ist}
-⚠️ <i>Max {MAX_TRADES_PER_DAY} signals per {SIGNAL_WINDOW_HOURS:g}h. Verify spread before acting.</i>"""
+⚠️ <i>{quota_note}. Verify spread before acting.</i>"""
 
     send_telegram(msg)
     if chart_path:
@@ -764,8 +770,10 @@ def main():
     print(f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f} | "
           f"Min Confidence: {MIN_CONFIDENCE}%")
     print(f"Paper mode: {PAPER_MODE}")
-    print(f"Quota: {MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling) | "
-          f"{len(signals_sent)} loaded from {STATE_FILE}")
+    quota_line = (f"{MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling)"
+                  if QUOTA_ENABLED
+                  else f"no cap ({SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown)")
+    print(f"Quota: {quota_line} | {len(signals_sent)} loaded from {STATE_FILE}")
 
     send_telegram(
         f"🚀 <b>XAUUSD SMC Bot LIVE</b>\n\n"
@@ -774,7 +782,7 @@ def main():
         f"+ Liquidity Zones + FVG + Patterns + RSI\n\n"
         f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
         f"Min Confidence: {MIN_CONFIDENCE}%\n"
-        f"Max Signals: {MAX_TRADES_PER_DAY} per {SIGNAL_WINDOW_HOURS:g}h (rolling)\n"
+        f"Max Signals: {quota_line}\n"
         f"Timeframes: 5M + 15M\n\n"
         f"Scanning every 5 minutes ⚔️"
     )
@@ -784,11 +792,12 @@ def main():
             now = datetime.now(IST)
             signals_sent = prune_state(signals_sent)
             used      = len(signals_sent)
-            remaining = max(0, MAX_TRADES_PER_DAY - used)
+            remaining = max(0, MAX_TRADES_PER_DAY - used) if QUOTA_ENABLED else None
+            sent_txt  = f"{used}/{MAX_TRADES_PER_DAY}" if QUOTA_ENABLED else f"{used} (no cap)"
 
             session = get_session()
             print(f"\n[{now.strftime('%H:%M')} IST] {session} | "
-                  f"Signals (last {SIGNAL_WINDOW_HOURS:g}h): {used}/{MAX_TRADES_PER_DAY}")
+                  f"Signals (last {SIGNAL_WINDOW_HOURS:g}h): {sent_txt}")
 
             # The quota limits alerts, never the scan — setups we cannot send
             # are still logged so nothing is silently missed.
@@ -815,7 +824,7 @@ def main():
                 if (last and last["direction"] == sig["signal"] and
                         now_ts - last["ts"] < SAME_DIRECTION_COOLDOWN):
                     print("Same direction within 45min — skipping.")
-                elif remaining <= 0:
+                elif QUOTA_ENABLED and remaining <= 0:
                     print(f"⏭ Skipped (quota {used}/{MAX_TRADES_PER_DAY}): "
                           f"{sig['signal']} @ {sig['price']} | "
                           f"conf {sig['confidence']}% | next slot in "
@@ -824,15 +833,16 @@ def main():
                     send_signal(sig, candles_5m)
                     signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
                     save_state(signals_sent)
-                    remaining -= 1
-                    if remaining == 0:
-                        send_telegram(
-                            f"🔴 <b>Signal Quota Reached</b>\n"
-                            f"{MAX_TRADES_PER_DAY} signals in the last "
-                            f"{SIGNAL_WINDOW_HOURS:g}h.\n"
-                            f"Still scanning — next alert in "
-                            f"{format_wait(signals_sent)}."
-                        )
+                    if QUOTA_ENABLED:
+                        remaining -= 1
+                        if remaining == 0:
+                            send_telegram(
+                                f"🔴 <b>Signal Quota Reached</b>\n"
+                                f"{MAX_TRADES_PER_DAY} signals in the last "
+                                f"{SIGNAL_WINDOW_HOURS:g}h.\n"
+                                f"Still scanning — next alert in "
+                                f"{format_wait(signals_sent)}."
+                            )
             else:
                 print("No signal. Waiting...")
 
