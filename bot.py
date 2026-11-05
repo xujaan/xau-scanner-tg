@@ -130,7 +130,7 @@ DB_SCHEMA = [
          id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
          direction TEXT NOT NULL, entry REAL, sl REAL, tp REAL, confidence INTEGER,
          outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
-         ai_verdict TEXT, ai_confidence INTEGER)""",
+         entry_bar TEXT, ai_verdict TEXT, ai_confidence INTEGER)""",
     """CREATE TABLE IF NOT EXISTS ai_reviews (
          ts REAL, model TEXT, verdict TEXT, confidence INTEGER,
          reasons TEXT, risk_note TEXT, latency_ms INTEGER)""",
@@ -207,35 +207,44 @@ def db_run(statements, fetch=False):
 
 def db_init():
     db_run([(sql, ()) for sql in DB_SCHEMA])
+    # Deployments that predate entry_bar keep their rows; add the column in place.
+    columns = db_run([("PRAGMA table_info(signals)", ())], fetch=True)
+    if columns and "entry_bar" not in [row[1] for row in columns]:
+        db_run([("ALTER TABLE signals ADD COLUMN entry_bar TEXT", ())])
     print(f"DB: {db_backend()} ({TURSO_DATABASE_URL if db_backend() == 'turso' else DB_FILE})")
 
 def db_save_bars(candles, timeframe):
-    """Store closed bars once; re-scanning the same candles adds nothing."""
+    """Upsert bars so a still-forming candle is corrected on the next scan."""
     if not candles:
         return
-    db_run([("INSERT OR IGNORE INTO bars (symbol, timeframe, bar_time, open, high, low, close) "
+    db_run([("INSERT OR REPLACE INTO bars (symbol, timeframe, bar_time, open, high, low, close) "
              "VALUES (?,?,?,?,?,?,?)",
              (SYMBOL, timeframe, c["time"], c["open"], c["high"], c["low"], c["close"]))
             for c in candles])
 
 def db_save_signal(rec):
     db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
-             "closed_ts, last_bar, ai_verdict, ai_confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             "closed_ts, last_bar, entry_bar, ai_verdict, ai_confidence) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
              (rec["ts"], rec["direction"], rec.get("entry"), rec.get("sl"), rec.get("tp"),
               rec.get("confidence"), rec.get("outcome", "OPEN"), rec.get("closed_ts"),
-              rec.get("last_bar"), rec.get("ai_verdict"), rec.get("ai_confidence")))])
+              rec.get("last_bar"), rec.get("entry_bar"), rec.get("ai_verdict"),
+              rec.get("ai_confidence")))])
 
 def db_update_signal(rec):
-    db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=? WHERE ts=? AND direction=?",
+    db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=?, entry_bar=? "
+             "WHERE ts=? AND direction=?",
              (rec.get("outcome"), rec.get("closed_ts"), rec.get("last_bar"),
-              rec["ts"], rec["direction"]))])
+              rec.get("entry_bar"), rec["ts"], rec["direction"]))])
 
 DB_SIGNAL_COLUMNS = ("ts", "direction", "entry", "sl", "tp", "confidence",
-                     "outcome", "closed_ts", "last_bar", "ai_verdict", "ai_confidence")
+                     "outcome", "closed_ts", "last_bar", "entry_bar",
+                     "ai_verdict", "ai_confidence")
 
 def db_load_journal(limit=None):
     rows = db_run([("SELECT ts, direction, entry, sl, tp, confidence, outcome, closed_ts, "
-                    "last_bar, ai_verdict, ai_confidence FROM signals ORDER BY ts DESC LIMIT ?",
+                    "last_bar, entry_bar, ai_verdict, ai_confidence "
+                    "FROM signals ORDER BY ts DESC LIMIT ?",
                     (limit or JOURNAL_MAX,))], fetch=True)
     return [dict(zip(DB_SIGNAL_COLUMNS, row)) for row in reversed(rows)]
 
@@ -290,12 +299,12 @@ def plan_prices(sig):
     return (round(sig["price"] + sig["sl_dollars"], 2),
             round(sig["price"] - sig["tp_dollars"], 2))
 
-def record_signal(journal, sig, opinion=None):
+def record_signal(journal, sig, opinion=None, entry_bar=None):
     sl, tp = plan_prices(sig)
     journal.append({
         "ts": time.time(), "direction": sig["signal"], "entry": sig["price"],
         "sl": sl, "tp": tp, "confidence": sig["confidence"],
-        "outcome": "OPEN", "closed_ts": None, "last_bar": None,
+        "outcome": "OPEN", "closed_ts": None, "last_bar": None, "entry_bar": entry_bar,
         "ai_verdict": (opinion or {}).get("verdict"),
         "ai_confidence": (opinion or {}).get("confidence"),
     })
@@ -312,9 +321,14 @@ def evaluate_journal(journal, candles):
     for rec in journal:
         if rec.get("outcome") != "OPEN":
             continue
-        last = rec.get("last_bar")
+        # Start at the bar that was forming when the alert went out. Walking the
+        # whole window replays pre-entry bars and marks almost every trade as an
+        # instant loss, so a record without an entry bar is left untouched.
+        last = rec.get("last_bar") or rec.get("entry_bar")
+        if not last:
+            continue
         for c in candles:
-            if last is not None and c["time"] <= last:
+            if c["time"] <= last:
                 continue
             last = c["time"]
             if rec["direction"] in ("BUY", "LONG"):
@@ -781,7 +795,10 @@ def get_candles_twelvedata(interval="5min", outputsize=100):
     url    = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL, "interval": interval,
-        "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY, "format": "JSON"
+        "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY, "format": "JSON",
+        # TwelveData otherwise stamps bars in the account timezone, which put
+        # every stored bar ~11h away from the real UTC time.
+        "timezone": "UTC",
     }
     try:
         r    = requests.get(url, params=params, timeout=15)
@@ -1547,7 +1564,7 @@ def main():
                     send_signal(sig, candles_5m)
                     ai_started = time.time()
                     opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
-                    journal = record_signal(journal, sig, opinion)
+                    journal = record_signal(journal, sig, opinion, candles_5m[-1]["time"])
                     if opinion:
                         send_ai_opinion(sig, opinion, stats)
                         db_save_ai_review(journal[-1], OPENROUTER_MODEL, opinion,
