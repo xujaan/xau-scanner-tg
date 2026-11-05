@@ -61,6 +61,7 @@ STATE_FILE              = os.environ.get("STATE_FILE", "signal_state.json")
 MIN_CONFIDENCE     = 65
 MIN_SL_DOLLARS     = 3.0
 MAX_SL_DOLLARS     = 20.0
+ATR_STOP_MULT      = 1.5    # SL distance in ATR(14) units
 MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
 EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
 IST                = pytz.timezone('Asia/Kolkata')
@@ -1128,6 +1129,18 @@ def calculate_rsi(candles, period=14):
         return 100
     return round(100 - (100 / (1 + avg_g / avg_l)), 2)
 
+def calculate_atr(candles, period=14):
+    """Average true range of the last `period` bars; None when history is short."""
+    if len(candles) < period + 1:
+        return None
+    ranges = []
+    for prev, cur in zip(candles[-period - 1:-1], candles[-period:]):
+        ranges.append(max(cur["high"] - cur["low"],
+                          abs(cur["high"] - prev["close"]),
+                          abs(cur["low"] - prev["close"])))
+    return sum(ranges) / period
+
+
 # ============================================
 # SMART SL PLACEMENT
 # ============================================
@@ -1304,13 +1317,21 @@ def generate_signal(candles_5m, candles_15m):
         print("No signal.")
         return None
 
-    # Smart SL placement
-    sl_dollars = calculate_sl_distance(
-        candles_5m,
-        "LONG" if signal == "LONG" else "SHORT",
-        ob_high, ob_low
-    )
-    sl_dollars = min(sl_dollars, MAX_SL_DOLLARS)
+    # Volatility stop. The structural OB stop sat inside gold's 5m noise: over
+    # 70 days it lost money before costs, while 1.5x ATR turned the same signals
+    # positive in both halves of the sample. Keep the structural stop only as a
+    # fallback when there is not enough history for ATR.
+    atr = calculate_atr(candles_5m)
+    if atr:
+        sl_dollars = min(ATR_STOP_MULT * atr, MAX_SL_DOLLARS)
+        sl_dollars = max(sl_dollars, MIN_SL_DOLLARS)
+    else:
+        sl_dollars = calculate_sl_distance(
+            candles_5m,
+            "LONG" if signal == "LONG" else "SHORT",
+            ob_high, ob_low
+        )
+        sl_dollars = min(sl_dollars, MAX_SL_DOLLARS)
     tp_dollars = sl_dollars * 2
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
