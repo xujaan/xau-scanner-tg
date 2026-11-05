@@ -181,7 +181,7 @@ def make_filters(names):
 
 
 def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
-        max_bars=288, cooldown=2700, min_confidence=None):
+        max_bars=288, cooldown=2700, min_confidence=None, spread=0.0):
     """Replay the engine bar by bar with no lookahead."""
     if min_confidence is not None:
         bot.MIN_CONFIDENCE = min_confidence
@@ -237,6 +237,10 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
             start = i + 1
 
         outcome, r = resolve(bars5, start, direction, entry, sl, tp, max_bars)
+        # Spread and slippage cost a fixed price amount per trade, so a tight
+        # stop pays more of it in R terms than a wide one.
+        if spread and risk > 0:
+            r -= spread / risk
         last_sent[direction] = now
         trades.append({"ts": now, "direction": direction, "outcome": outcome,
                        "r": r, "risk": round(risk, 2), "rsi": sig["rsi"],
@@ -298,6 +302,9 @@ def main():
     ap.add_argument("--max-bars", type=int, default=288)
     ap.add_argument("--start", help="first UTC date, YYYY-MM-DD")
     ap.add_argument("--end", help="last UTC date, YYYY-MM-DD")
+    ap.add_argument("--spread", type=float, default=0.0,
+                    help="round-trip cost in $/oz, applied per trade")
+    ap.add_argument("--only", help="semicolon-separated variant name filters")
     args = ap.parse_args()
 
     bars5 = load_bars(args.refresh)
@@ -318,9 +325,13 @@ def main():
               f"{'TO':>4} {'WR%':>5} {'E[R]':>6} {'totR':>7} {'DD':>5} {'avgSL':>6}")
     print(header)
     print("-" * len(header))
-    for name, cfg in VARIANTS:
+    print(f"cost model: ${args.spread:.2f}/oz per trade\n")
+    variants = [v for v in VARIANTS if not args.only or
+                any(k.strip().lower() in v[0].lower()
+                    for k in args.only.split(";"))]
+    for name, cfg in variants:
         result = run(bars5, bars15, max_bars=args.max_bars,
-                     min_confidence=args.min_conf, **cfg)
+                     min_confidence=args.min_conf, spread=args.spread, **cfg)
         wr = "-" if result["wr"] is None else result["wr"]
         print(f"{name:26} {result['generated']:>4} {result['trades']:>4} "
               f"{result['unfilled']:>4} {result['tp']:>4} {result['sl']:>4} "
