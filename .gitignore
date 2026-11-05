@@ -229,3 +229,6 @@ signal_journal.json.tmp
 signals.db
 signals.db-wal
 signals.db-shm
+
+# Backtest data cache (downloaded, not source)
+backtest_data/
