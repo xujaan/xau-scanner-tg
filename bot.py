@@ -62,6 +62,7 @@ MIN_CONFIDENCE     = 65
 MIN_SL_DOLLARS     = 3.0
 MAX_SL_DOLLARS     = 20.0
 ATR_STOP_MULT      = 1.5    # SL distance in ATR(14) units
+MAX_LONG_4H_MOVE   = 0.3    # percent — skip a LONG after a 4h run this large
 MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
 EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
 IST                = pytz.timezone('Asia/Kolkata')
@@ -1183,6 +1184,15 @@ def calculate_atr(candles, period=14):
                           abs(cur["low"] - prev["close"])))
     return sum(ranges) / period
 
+def four_hour_return(candles, bars=48):
+    """Percent move over the last `bars` 5m candles; None when history is short."""
+    if len(candles) < bars + 1:
+        return None
+    then = candles[-bars - 1]["close"]
+    if then <= 0:
+        return None
+    return (candles[-1]["close"] - then) / then * 100
+
 
 # ============================================
 # SMART SL PLACEMENT
@@ -1359,6 +1369,16 @@ def generate_signal(candles_5m, candles_15m):
     if not signal:
         print("No signal.")
         return None
+
+    # LONG was buying the end of a 4h rally: 140 of 299 backtest longs entered
+    # after a >+0.3% 4h move and lost 43.6R, while the rest were slightly positive.
+    # The short side does not chase the same way, so it is left untouched.
+    if signal == "LONG":
+        move_4h = four_hour_return(candles_5m)
+        if move_4h is not None and move_4h > MAX_LONG_4H_MOVE:
+            print(f"LONG rejected: 4h move {move_4h:+.2f}% is already extended "
+                  f"(> {MAX_LONG_4H_MOVE}%).")
+            return None
 
     # Volatility stop. The structural OB stop sat inside gold's 5m noise: over
     # 70 days it lost money before costs, while 1.5x ATR turned the same signals
