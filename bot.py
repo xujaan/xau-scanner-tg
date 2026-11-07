@@ -85,8 +85,9 @@ def load_state():
             raw = json.load(fh)
         history = []
         for item in raw.get("signals", []):
-            direction = str(item["direction"])
-            if direction in ("BUY", "SELL", "LONG", "SHORT"):
+            direction = {"BUY": "LONG", "SELL": "SHORT"}.get(str(item["direction"]),
+                                                               str(item["direction"]))
+            if direction in ("LONG", "SHORT"):
                 history.append({"ts": float(item["ts"]), "direction": direction})
         history.sort(key=lambda s: s["ts"])
         return prune_state(history)
@@ -110,6 +111,48 @@ def prune_state(history, now_ts=None):
     """Drop signals that have left the rolling window."""
     now_ts = time.time() if now_ts is None else now_ts
     return [s for s in history if now_ts - s["ts"] < SIGNAL_WINDOW]
+
+def last_sent_ts(history, direction):
+    """Newest timestamp for one direction. The whole window is scanned so an
+    alternating signal cannot reset the same-direction cooldown."""
+    for item in reversed(history):
+        if item["direction"] == direction:
+            return item["ts"]
+    return None
+
+def same_direction_wait(history, direction, now_ts=None):
+    """Seconds left before another signal in `direction` is allowed."""
+    now_ts = time.time() if now_ts is None else now_ts
+    last = last_sent_ts(history, direction)
+    if last is None:
+        return 0
+    return max(0, int(last + SAME_DIRECTION_COOLDOWN - now_ts))
+
+def seed_state_from_journal(history, journal, now_ts=None):
+    """Merge the durable journal into the throttle window.
+
+    STATE_FILE lives on an emptyDir in k8s, so a restart forgets the cooldown
+    while the journal survives in Turso. Without this the first scans after a
+    deploy can fire a burst of duplicate signals.
+    """
+    now_ts = time.time() if now_ts is None else now_ts
+    merged = list(history)
+    for rec in journal:
+        try:
+            ts = float(rec["ts"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        direction = {"BUY": "LONG", "SELL": "SHORT"}.get(str(rec.get("direction")),
+                                                           str(rec.get("direction")))
+        if direction not in ("LONG", "SHORT") or now_ts - ts >= SIGNAL_WINDOW:
+            continue
+        # record_signal stamps the journal a few seconds after the state entry;
+        # a one-minute tolerance dedupes the same alert without merging real ones.
+        if any(s["direction"] == direction and abs(s["ts"] - ts) < 60 for s in merged):
+            continue
+        merged.append({"ts": ts, "direction": direction})
+    merged.sort(key=lambda s: s["ts"])
+    return prune_state(merged, now_ts)
 
 def format_wait(history, now_ts=None):
     """Time until the oldest signal leaves the window and a slot frees up."""
@@ -1500,7 +1543,10 @@ def main():
         if not journal and legacy:
             journal = legacy
             print("Journal: DB empty or unavailable — continuing from the JSON journal.")
-    print(f"Journal: {len(journal)} signals loaded")
+    signals_sent = seed_state_from_journal(signals_sent, journal)
+    save_state(signals_sent)
+    print(f"Journal: {len(journal)} signals loaded | "
+          f"Throttle: {len(signals_sent)} recent signals (state + journal)")
     journal_cache, stats_cache = journal, journal_stats(journal)
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
@@ -1570,12 +1616,12 @@ def main():
 
             if sig:
                 now_ts = time.time()
-                last   = signals_sent[-1] if signals_sent else None
+                wait = same_direction_wait(signals_sent, sig["signal"], now_ts)
                 if alerts_paused:
                     print(f"⏸ Paused — {sig['signal']} @ {sig['price']} not sent.")
-                elif (last and last["direction"] == sig["signal"] and
-                        now_ts - last["ts"] < SAME_DIRECTION_COOLDOWN):
-                    print("Same direction within 45min — skipping.")
+                elif wait > 0:
+                    print(f"{sig['signal']} within {SAME_DIRECTION_COOLDOWN // 60}min "
+                          f"of the last {sig['signal']} — skipping ({wait}s left).")
                 elif QUOTA_ENABLED and remaining <= 0:
                     print(f"⏭ Skipped (quota {used}/{MAX_TRADES_PER_DAY}): "
                           f"{sig['signal']} @ {sig['price']} | "
