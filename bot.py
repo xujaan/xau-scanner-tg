@@ -67,6 +67,20 @@ DAILY_LOSS_LIMIT_R     = float(os.environ.get("DAILY_LOSS_LIMIT_R", 3.0))
 WEEKEND_BLACKOUT_HOURS      = float(os.environ.get("WEEKEND_BLACKOUT_HOURS", 2))
 DAILY_BREAK_BLACKOUT_MINUTES = int(os.environ.get("DAILY_BREAK_BLACKOUT_MINUTES", 30))
 
+# Shadow logger: evaluate alternative filters next to the live signal without
+# sending anything. The variants are deliberately simple so each one has a
+# testable sample instead of another pile of fitted parameters.
+SHADOW_ENABLED  = os.environ.get("SHADOW_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+SHADOW_MIN_ATR  = float(os.environ.get("SHADOW_MIN_ATR", 4.0))
+SHADOW_SPREAD   = float(os.environ.get("SHADOW_SPREAD", 0.20))
+SHADOW_VARIANTS = (
+    ("baseline",   {}),
+    ("long_only",  {"direction": "LONG"}),
+    ("short_only", {"direction": "SHORT"}),
+    ("short_vol",  {"direction": "SHORT", "min_atr": SHADOW_MIN_ATR}),
+    ("no_asia",    {"exclude_utc_hours": (4, 5, 6)}),
+)
+
 # Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
 # window. 0 (the default) means no cap at all — the same-direction cooldown below is
 # then the only throttle. No midnight reset either way.
@@ -199,6 +213,13 @@ DB_SCHEMA = [
     """CREATE TABLE IF NOT EXISTS ai_reviews (
          ts REAL, model TEXT, verdict TEXT, confidence INTEGER,
          reasons TEXT, risk_note TEXT, latency_ms INTEGER)""",
+    """CREATE TABLE IF NOT EXISTS shadow_signals (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         variant TEXT NOT NULL, ts REAL NOT NULL, direction TEXT NOT NULL,
+         entry REAL, sl REAL, tp REAL, confidence INTEGER,
+         outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
+         entry_bar TEXT, entry_ts REAL, risk_usd REAL, mfe REAL, mae REAL,
+         UNIQUE(variant, ts, direction))""",
 ]
 
 def db_backend():
@@ -351,6 +372,33 @@ def db_migrate_journal(records):
             for r in records])
     return len(records)
 
+SHADOW_COLUMNS = ("variant", "ts", "direction", "entry", "sl", "tp", "confidence",
+                  "outcome", "closed_ts", "last_bar", "entry_bar", "entry_ts",
+                  "risk_usd", "mfe", "mae")
+
+def db_save_shadow_signal(rec):
+    db_run([("INSERT OR IGNORE INTO shadow_signals (variant, ts, direction, entry, sl, tp, "
+             "confidence, outcome, closed_ts, last_bar, entry_bar, entry_ts, "
+             "risk_usd, mfe, mae) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             tuple(rec.get(key) for key in SHADOW_COLUMNS))])
+
+def db_update_shadow_signal(rec):
+    db_run([("UPDATE shadow_signals SET entry=?, sl=?, tp=?, confidence=?, outcome=?, "
+             "closed_ts=?, last_bar=?, entry_bar=?, entry_ts=?, risk_usd=?, mfe=?, mae=? "
+             "WHERE variant=? AND ts=? AND direction=?",
+             (rec.get("entry"), rec.get("sl"), rec.get("tp"), rec.get("confidence"),
+              rec.get("outcome"), rec.get("closed_ts"), rec.get("last_bar"),
+              rec.get("entry_bar"), rec.get("entry_ts"), rec.get("risk_usd"),
+              rec.get("mfe"), rec.get("mae"), rec.get("variant"), rec.get("ts"),
+              rec.get("direction")))])
+
+def db_load_shadow_journal(limit=5000):
+    rows = db_run([("SELECT variant, ts, direction, entry, sl, tp, confidence, "
+                    "outcome, closed_ts, last_bar, entry_bar, entry_ts, "
+                    "risk_usd, mfe, mae FROM shadow_signals "
+                    "ORDER BY ts DESC LIMIT ?", (limit,))], fetch=True)
+    return [dict(zip(SHADOW_COLUMNS, row)) for row in reversed(rows)]
+
 # ============================================
 # SIGNAL JOURNAL  (every alert, and how it resolved)
 # ============================================
@@ -456,7 +504,8 @@ def closed_candles(candles, interval="5min", now=None):
             closed.append(candle)
     return closed
 
-def evaluate_journal(journal, candles, interval_minutes=5, now=None):
+def evaluate_journal(journal, candles, interval_minutes=5, now=None,
+                     updater=None, persist=True):
     """Resolve OPEN records from closed bars only.
 
     A record starts after its entry bar. Each bar is evaluated exactly once,
@@ -466,6 +515,7 @@ def evaluate_journal(journal, candles, interval_minutes=5, now=None):
     candles = closed_candles(candles, f"{interval_minutes}min", now=now)
     if not candles:
         return journal
+    update = updater or db_update_signal
     changed = False
     for rec in journal:
         if rec.get("outcome") != "OPEN":
@@ -523,13 +573,122 @@ def evaluate_journal(journal, candles, interval_minutes=5, now=None):
         if risk > 0:
             rec["mfe"] = round(mfe, 4)
             rec["mae"] = round(mae, 4)
-        db_update_signal(rec)
+        update(rec)
         changed = True
         if resolved:
             continue
-    if changed:
+    if changed and persist:
         save_journal(journal)
     return journal
+
+def evaluate_shadow(shadow, candles, interval_minutes=5, now=None):
+    return evaluate_journal(shadow, candles, interval_minutes, now,
+                            updater=db_update_shadow_signal, persist=False)
+
+def shadow_recent(shadow, variant, direction, now_ts):
+    for rec in reversed(shadow):
+        if rec.get("variant") == variant and rec.get("direction") == direction:
+            return now_ts - float(rec.get("ts") or 0) < SAME_DIRECTION_COOLDOWN
+    return False
+
+def shadow_variant_allows(rules, sig, now_ts):
+    direction = rules.get("direction")
+    if direction and sig.get("signal") != direction:
+        return False
+    min_atr = rules.get("min_atr")
+    atr = sig.get("atr")
+    if min_atr is not None and (atr is None or atr < min_atr):
+        return False
+    excluded = rules.get("exclude_utc_hours") or ()
+    if excluded and datetime.fromtimestamp(now_ts, pytz.UTC).hour in excluded:
+        return False
+    return True
+
+def record_shadow_signals(shadow, sig, entry_bar, now_ts):
+    """Record the same signal under each shadow filter; never sends anything."""
+    if not SHADOW_ENABLED:
+        return shadow
+    sl, tp = plan_prices(sig)
+    for variant, rules in SHADOW_VARIANTS:
+        if not shadow_variant_allows(rules, sig, now_ts):
+            continue
+        if shadow_recent(shadow, variant, sig["signal"], now_ts):
+            continue
+        rec = {
+            "variant": variant, "ts": now_ts, "direction": sig["signal"],
+            "entry": sig["price"], "sl": sl, "tp": tp,
+            "confidence": sig["confidence"], "outcome": "OPEN",
+            "closed_ts": None, "last_bar": None, "entry_bar": entry_bar,
+            "entry_ts": now_ts, "risk_usd": sig.get("potential_loss"),
+            "mfe": None, "mae": None,
+        }
+        shadow.append(rec)
+        db_save_shadow_signal(rec)
+    return shadow
+
+def shadow_stats(shadow, spread=None):
+    spread = SHADOW_SPREAD if spread is None else spread
+    result = {}
+    for variant, _rules in SHADOW_VARIANTS:
+        recs = sorted((r for r in shadow if r.get("variant") == variant),
+                      key=lambda r: r.get("ts") or 0)
+        tp = sl = open_n = unverified = 0
+        net_total = 0.0
+        curve = peak = max_dd = 0.0
+        for rec in recs:
+            if rec.get("outcome") == "OPEN":
+                open_n += 1
+                continue
+            if rec.get("outcome") not in ("TP", "SL"):
+                continue
+            if not rec.get("entry_bar"):
+                unverified += 1
+                continue
+            gross = 2.0 if rec["outcome"] == "TP" else -1.0
+            if rec["outcome"] == "TP":
+                tp += 1
+            else:
+                sl += 1
+            risk_price = abs((rec.get("entry") or 0) - (rec.get("sl") or 0))
+            cost_r = spread / risk_price if risk_price > 0 else 0.0
+            net = gross - cost_r
+            net_total += net
+            curve += net
+            peak = max(peak, curve)
+            max_dd = max(max_dd, peak - curve)
+        closed = tp + sl
+        result[variant] = {
+            "closed": closed, "tp": tp, "sl": sl, "open": open_n,
+            "unverified": unverified,
+            "wr": 100.0 * tp / closed if closed else 0.0,
+            "total_r": 2.0 * tp - sl,
+            "e_r": (2.0 * tp - sl) / closed if closed else 0.0,
+            "net_total_r": net_total,
+            "net_e_r": net_total / closed if closed else 0.0,
+            "max_dd": max_dd,
+        }
+    return result
+
+def shadow_report_text():
+    stats = shadow_stats(shadow_cache or [])
+    lines = [
+        "🧪 <b>Shadow variants</b>",
+        f"Cost ${SHADOW_SPREAD:.2f}/oz | min ATR {SHADOW_MIN_ATR:g} | closed 5m bars",
+        "",
+    ]
+    for variant, _rules in SHADOW_VARIANTS:
+        st = stats[variant]
+        if not st["closed"]:
+            lines.append(f"• <b>{variant}</b>: 0 closed | {st['open']} open")
+            continue
+        lines.append(
+            f"• <b>{variant}</b>: {st['tp']}/{st['closed']} WR {st['wr']:.0f}% | "
+            f"E[R] {st['e_r']:+.2f} | net {st['net_total_r']:+.1f}R "
+            f"(DD {st['max_dd']:.1f}R) | {st['open']} open"
+        )
+    lines.append("")
+    lines.append("Shadow only — no Telegram alerts, no broker orders.")
+    return "\n".join(lines)
 
 def score_band(confidence):
     if confidence >= 85:
@@ -733,6 +892,7 @@ def send_photo(photo_path, caption=""):
 # Shared with the command handlers, which run on the listener thread.
 journal_cache = []
 stats_cache   = None
+shadow_cache  = []
 alerts_paused = False
 
 def cmd_help():
@@ -742,6 +902,7 @@ def cmd_help():
         "/price — price, 15M bias and RSI (2 API requests)\n"
         "/status — market, alerts, storage and AI state\n"
         "/stats — hit rate and AI calibration\n"
+        "/shadow — compare shadow strategy variants\n"
         "/journal — last 5 alerts with outcomes\n"
         "/settings — active configuration\n"
         "/pause — stop sending alerts\n"
@@ -824,6 +985,15 @@ def cmd_journal():
                      f"@ {rec.get('entry')} conf {rec.get('confidence')}%{ai}")
     send_telegram("\n".join(lines))
 
+def cmd_shadow():
+    if not SHADOW_ENABLED:
+        send_telegram("🧪 <b>Shadow logger is off</b>\nSet SHADOW_ENABLED=1 to record variants.")
+        return
+    if not shadow_cache:
+        send_telegram("🧪 <b>Shadow variants</b>\nBelum ada record. Shadow berjalan setiap scan.")
+        return
+    send_telegram(shadow_report_text())
+
 def cmd_price():
     send_telegram("🔄 Fetching price...")
     candles    = get_candles("5min", 60)
@@ -856,6 +1026,7 @@ def cmd_settings():
         f"Risk/trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:g}% of ${CAPITAL:.0f})\n"
         f"Max open: {MAX_OPEN_POSITIONS} | heat cap: {MAX_PORTFOLIO_HEAT_PCT*100:g}%\n"
         f"Daily loss stop: {DAILY_LOSS_LIMIT_R:.1f}R | weekend blackout: {WEEKEND_BLACKOUT_HOURS:g}h\n"
+        f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz\n"
         f"Paper mode: {PAPER_MODE}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
         f"DB: {db_backend()}"
@@ -875,6 +1046,7 @@ COMMAND_HANDLERS = {
     "/help":     cmd_help,
     "/status":   cmd_status,
     "/stats":    cmd_stats,
+    "/shadow":   cmd_shadow,
     "/journal":  cmd_journal,
     "/price":    cmd_price,
     "/settings": cmd_settings,
@@ -1559,6 +1731,7 @@ def generate_signal(candles_5m, candles_15m):
         "lots":          lots,
         "potential_loss": actual_risk,
         "risk_safe":     is_safe,
+        "atr":           atr,
         "confidence":    score,
         "reasons":       reasons,
         "rsi":           rsi,
@@ -1752,7 +1925,7 @@ def realized_r_today(journal, now=None):
 # MAIN LOOP
 # ============================================
 def main():
-    global signals_sent, journal_cache, stats_cache
+    global signals_sent, journal_cache, stats_cache, shadow_cache
 
     signals_sent = load_state()
 
@@ -1785,6 +1958,10 @@ def main():
     print(f"Journal: {len(journal)} signals loaded | "
           f"Throttle: {len(signals_sent)} recent signals (state + journal)")
     journal_cache, stats_cache = journal, journal_stats(journal)
+    shadow = db_load_shadow_journal() if SHADOW_ENABLED else []
+    shadow_cache = shadow
+    print(f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | {len(shadow)} records | "
+          f"min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz")
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
     scan_event = threading.Event()
@@ -1844,6 +2021,9 @@ def main():
                 continue
 
             journal = evaluate_journal(journal, candles_5m, interval_minutes=5)
+            if SHADOW_ENABLED:
+                shadow = evaluate_shadow(shadow, candles_5m, interval_minutes=5)
+                shadow_cache = shadow
             stats   = journal_stats(journal)
             db_save_bars(candles_5m, "5min")
             db_save_bars(candles_15m, "15min")
@@ -1853,6 +2033,10 @@ def main():
 
             if sig:
                 now_ts = time.time()
+                if SHADOW_ENABLED:
+                    shadow = record_shadow_signals(shadow, sig,
+                                                   candles_5m[-1]["time"], now_ts)
+                    shadow_cache = shadow
                 wait = same_direction_wait(signals_sent, sig["signal"], now_ts)
                 blackout = entry_blackout()
                 day_r = realized_r_today(journal)

@@ -51,6 +51,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Capital Adequacy Checks**: Gold is volatile. The bot mathematically verifies if your account balance can handle the minimum lot size for a specific setup's stop-loss. If the risk is too high, it dynamically rejects the trade.
 - **Portfolio Guards**: At most one open signal by default, a total heat cap (default 4% of capital), a daily loss brake (default 3R), and a blackout before the Friday close and the daily settlement break.
 - **Journal Integrity**: Only closed candles are evaluated, each bar is processed once after it closes, and every alert stores its entry timestamp, actual risk, MFE and MAE. Records without an entry bar are marked unverified, excluded from hit-rate stats, and reported by `reconcile.py`.
+- **Shadow Variants**: Every scan is also recorded under several filters — baseline, LONG-only, SHORT-only, SHORT + minimum ATR, and no-Asia (04:00–06:59 UTC) — resolved by the same closed-bar evaluator, with `/shadow` showing cost-adjusted R. Shadows never send alerts. They evaluate the signal selected by the live engine; they do not search for a second setup when that direction is filtered out.
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Calendar Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown plus the portfolio risk guards and daily loss brake.
@@ -68,6 +69,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 | `/price` | Current price, 15M bias and 5M RSI | 2 requests |
 | `/status` | Market open/closed, data provider, DB backend, AI state, alerts paused | – |
 | `/stats` | Hit rate overall, per direction, per confidence band, and per AI verdict | – |
+| `/shadow` | Compare shadow variants (baseline, long/short-only, volatility, no-Asia) with cost-adjusted R | – |
 | `/journal` | Last 5 alerts with TP / SL / OPEN outcome | – |
 | `/settings` | Active configuration (provider, cap, cooldown, model) | – |
 | `/pause`, `/resume` | Stop and resume alert sending; scanning continues | – |
@@ -151,6 +153,9 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `DAILY_LOSS_LIMIT_R` | Optional. Stop sending new alerts after this many closed R today (default `3.0`). |
 | `WEEKEND_BLACKOUT_HOURS` | Optional. No new entries this many hours before the Friday close (default `2`). |
 | `DAILY_BREAK_BLACKOUT_MINUTES` | Optional. No new entries this many minutes before the daily settlement break (default `30`). |
+| `SHADOW_ENABLED` | Optional. Record shadow variants on every scan (default `1`; set `0` to disable). |
+| `SHADOW_MIN_ATR` | Optional. Minimum 5M ATR for the `short_vol` shadow variant (default `4.0`). |
+| `SHADOW_SPREAD` | Optional. Round-trip cost in $/oz used by `/shadow` (default `0.20`). |
 | `OPENROUTER_API_KEY` | Optional. Enables the AI second opinion. Without it the AI layer stays off. |
 | `OPENROUTER_MODEL` | Optional. Default `deepseek/deepseek-v4.1-flash-1017`. Pin a dated snapshot ID. |
 | `AI_TIMEOUT` | Optional. Seconds before the AI call is abandoned (default `20`). |

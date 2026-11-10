@@ -67,6 +67,13 @@ spec:
               value: "2"
             - name: DAILY_BREAK_BLACKOUT_MINUTES
               value: "30"
+            # Shadow evaluation (no alerts, no orders).
+            - name: SHADOW_ENABLED
+              value: "1"
+            - name: SHADOW_MIN_ATR
+              value: "4.0"
+            - name: SHADOW_SPREAD
+              value: "0.20"
           resources:
             requests:
               cpu: 50m
