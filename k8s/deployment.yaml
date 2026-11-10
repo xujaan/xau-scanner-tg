@@ -50,6 +50,23 @@ spec:
               value: twelvedata
             - name: OPENROUTER_MODEL
               value: deepseek/deepseek-v4.1-flash-1017
+            # Risk controls (non-secret). Override per environment as needed.
+            - name: CAPITAL
+              value: "200"
+            - name: RISK_PERCENT
+              value: "0.02"
+            - name: MAX_RISK_MULTIPLE
+              value: "2.0"
+            - name: MAX_OPEN_POSITIONS
+              value: "1"
+            - name: MAX_PORTFOLIO_HEAT_PCT
+              value: "0.04"
+            - name: DAILY_LOSS_LIMIT_R
+              value: "3"
+            - name: WEEKEND_BLACKOUT_HOURS
+              value: "2"
+            - name: DAILY_BREAK_BLACKOUT_MINUTES
+              value: "30"
           resources:
             requests:
               cpu: 50m

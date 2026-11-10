@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import re
 import requests
 import sqlite3
 import threading
@@ -44,9 +46,26 @@ TURSO_AUTH_TOKEN   = os.environ.get("TURSO_AUTH_TOKEN")
 DB_FILE            = os.environ.get("DB_FILE", "signals.db")
 
 SYMBOL       = "XAU/USD"
-CAPITAL      = 200
-RISK_PERCENT = 0.05
-RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $10
+CAPITAL      = float(os.environ.get("CAPITAL", 200))
+# Risk per signal. The old default was 5% ($10 on $200), which is far too much
+# for a $200 account when the minimum 0.01 lot can already risk more than that.
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 0.02))
+RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $4 at defaults
+
+# A signal is rejected when the smallest tradable lot would risk more than this
+# multiple of RISK_AMOUNT. This stops a wide stop from quietly becoming a 8% bet.
+MAX_RISK_MULTIPLE = float(os.environ.get("MAX_RISK_MULTIPLE", 2.0))
+
+# Portfolio guards. Every signal is the same instrument, so several alerts in a
+# row are one concentrated bet, not diversification.
+MAX_OPEN_POSITIONS     = int(os.environ.get("MAX_OPEN_POSITIONS", 1))
+MAX_PORTFOLIO_HEAT_PCT = float(os.environ.get("MAX_PORTFOLIO_HEAT_PCT", 0.04))
+DAILY_LOSS_LIMIT_R     = float(os.environ.get("DAILY_LOSS_LIMIT_R", 3.0))
+
+# Do not open a fresh position right before the weekly close or the daily
+# settlement break; there is no time for the trade to work and gaps are wider.
+WEEKEND_BLACKOUT_HOURS      = float(os.environ.get("WEEKEND_BLACKOUT_HOURS", 2))
+DAILY_BREAK_BLACKOUT_MINUTES = int(os.environ.get("DAILY_BREAK_BLACKOUT_MINUTES", 30))
 
 # Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
 # window. 0 (the default) means no cap at all — the same-direction cooldown below is
@@ -175,7 +194,8 @@ DB_SCHEMA = [
          id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
          direction TEXT NOT NULL, entry REAL, sl REAL, tp REAL, confidence INTEGER,
          outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
-         entry_bar TEXT, ai_verdict TEXT, ai_confidence INTEGER)""",
+         entry_bar TEXT, entry_ts REAL, risk_usd REAL, mfe REAL, mae REAL,
+         ai_verdict TEXT, ai_confidence INTEGER)""",
     """CREATE TABLE IF NOT EXISTS ai_reviews (
          ts REAL, model TEXT, verdict TEXT, confidence INTEGER,
          reasons TEXT, risk_note TEXT, latency_ms INTEGER)""",
@@ -250,16 +270,26 @@ def db_run(statements, fetch=False):
         print(f"DB error: {e}")
         return []
 
+SIGNAL_MIGRATIONS = (
+    ("entry_bar", "TEXT"),
+    ("entry_ts", "REAL"),
+    ("risk_usd", "REAL"),
+    ("mfe", "REAL"),
+    ("mae", "REAL"),
+)
+
 def db_init():
     db_run([(sql, ()) for sql in DB_SCHEMA])
-    # Deployments that predate entry_bar keep their rows; add the column in place.
+    # Deployments that predate a column keep their rows; add columns in place.
     columns = db_run([("PRAGMA table_info(signals)", ())], fetch=True)
-    if columns and "entry_bar" not in [row[1] for row in columns]:
-        db_run([("ALTER TABLE signals ADD COLUMN entry_bar TEXT", ())])
+    existing = [row[1] for row in columns]
+    for name, decl in SIGNAL_MIGRATIONS:
+        if name not in existing:
+            db_run([(f"ALTER TABLE signals ADD COLUMN {name} {decl}", ())])
     print(f"DB: {db_backend()} ({TURSO_DATABASE_URL if db_backend() == 'turso' else DB_FILE})")
 
 def db_save_bars(candles, timeframe):
-    """Upsert bars so a still-forming candle is corrected on the next scan."""
+    """Upsert bars so a corrected close replaces the first stored snapshot."""
     if not candles:
         return
     db_run([("INSERT OR REPLACE INTO bars (symbol, timeframe, bar_time, open, high, low, close) "
@@ -269,26 +299,32 @@ def db_save_bars(candles, timeframe):
 
 def db_save_signal(rec):
     db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
-             "closed_ts, last_bar, entry_bar, ai_verdict, ai_confidence) "
-             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+             "closed_ts, last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
+             "ai_verdict, ai_confidence) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (rec["ts"], rec["direction"], rec.get("entry"), rec.get("sl"), rec.get("tp"),
               rec.get("confidence"), rec.get("outcome", "OPEN"), rec.get("closed_ts"),
-              rec.get("last_bar"), rec.get("entry_bar"), rec.get("ai_verdict"),
-              rec.get("ai_confidence")))])
+              rec.get("last_bar"), rec.get("entry_bar"), rec.get("entry_ts"),
+              rec.get("risk_usd"), rec.get("mfe"), rec.get("mae"),
+              rec.get("ai_verdict"), rec.get("ai_confidence")))])
 
 def db_update_signal(rec):
-    db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=?, entry_bar=? "
+    db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=?, entry_bar=?, "
+             "entry_ts=?, risk_usd=?, mfe=?, mae=? "
              "WHERE ts=? AND direction=?",
              (rec.get("outcome"), rec.get("closed_ts"), rec.get("last_bar"),
-              rec.get("entry_bar"), rec["ts"], rec["direction"]))])
+              rec.get("entry_bar"), rec.get("entry_ts"), rec.get("risk_usd"),
+              rec.get("mfe"), rec.get("mae"), rec["ts"], rec["direction"]))])
 
 DB_SIGNAL_COLUMNS = ("ts", "direction", "entry", "sl", "tp", "confidence",
                      "outcome", "closed_ts", "last_bar", "entry_bar",
+                     "entry_ts", "risk_usd", "mfe", "mae",
                      "ai_verdict", "ai_confidence")
 
 def db_load_journal(limit=None):
     rows = db_run([("SELECT ts, direction, entry, sl, tp, confidence, outcome, closed_ts, "
-                    "last_bar, entry_bar, ai_verdict, ai_confidence "
+                    "last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
+                    "ai_verdict, ai_confidence "
                     "FROM signals ORDER BY ts DESC LIMIT ?",
                     (limit or JOURNAL_MAX,))], fetch=True)
     return [dict(zip(DB_SIGNAL_COLUMNS, row)) for row in reversed(rows)]
@@ -304,10 +340,14 @@ def db_migrate_journal(records):
     if not records:
         return 0
     db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
-             "closed_ts, last_bar, ai_verdict, ai_confidence) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+             "closed_ts, last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
+             "ai_verdict, ai_confidence) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (r["ts"], r["direction"], r.get("entry"), r.get("sl"), r.get("tp"),
               r.get("confidence"), r.get("outcome", "OPEN"), r.get("closed_ts"),
-              r.get("last_bar"), r.get("ai_verdict"), r.get("ai_confidence")))
+              r.get("last_bar"), r.get("entry_bar"), r.get("entry_ts"),
+              r.get("risk_usd"), r.get("mfe"), r.get("mae"),
+              r.get("ai_verdict"), r.get("ai_confidence")))
             for r in records])
     return len(records)
 
@@ -344,12 +384,15 @@ def plan_prices(sig):
     return (round(sig["price"] + sig["sl_dollars"], 2),
             round(sig["price"] - sig["tp_dollars"], 2))
 
-def record_signal(journal, sig, opinion=None, entry_bar=None):
+def record_signal(journal, sig, opinion=None, entry_bar=None, entry_ts=None):
     sl, tp = plan_prices(sig)
     journal.append({
         "ts": time.time(), "direction": sig["signal"], "entry": sig["price"],
         "sl": sl, "tp": tp, "confidence": sig["confidence"],
         "outcome": "OPEN", "closed_ts": None, "last_bar": None, "entry_bar": entry_bar,
+        "entry_ts": entry_ts if entry_ts is not None else time.time(),
+        "risk_usd": sig.get("potential_loss"),
+        "mfe": None, "mae": None,
         "ai_verdict": (opinion or {}).get("verdict"),
         "ai_confidence": (opinion or {}).get("confidence"),
     })
@@ -357,9 +400,70 @@ def record_signal(journal, sig, opinion=None, entry_bar=None):
     db_save_signal(journal[-1])
     return journal
 
-def evaluate_journal(journal, candles):
-    """Resolve OPEN records by walking only the bars that printed after they were sent.
-    A bar that touches both levels is counted as a loss."""
+BAR_SECONDS = {
+    "1min": 60,
+    "5min": 300,
+    "15min": 900,
+    "30min": 1800,
+    "1h": 3600,
+    "4h": 14400,
+}
+
+def bar_epoch(value):
+    """Parse a provider bar timestamp to an epoch. Returns None when unknown."""
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    # OANDA uses nanoseconds; datetime.fromisoformat wants at most microseconds.
+    raw = re.sub(r"(\.\d{6})\d+", r"\1", raw)
+    try:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=pytz.UTC)
+        return parsed.timestamp()
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(raw, fmt).replace(tzinfo=pytz.UTC).timestamp()
+        except ValueError:
+            continue
+    return None
+
+def bar_close_ts(value, interval_minutes=5):
+    opened = bar_epoch(value)
+    return None if opened is None else opened + interval_minutes * 60
+
+def closed_candles(candles, interval="5min", now=None):
+    """Drop the still-forming last bar.
+
+    Signal generation and journal evaluation must both use bars whose OHLC is
+    final; otherwise a TP/SL touched later in the same bar can be missed and the
+    stored entry price is not the candle close.
+    """
+    if not candles:
+        return []
+    seconds = BAR_SECONDS.get(interval)
+    if not seconds:
+        return list(candles)
+    now = time.time() if now is None else now
+    closed = []
+    for candle in candles:
+        opened = bar_epoch(candle.get("time"))
+        if opened is None or opened + seconds <= now:
+            closed.append(candle)
+    return closed
+
+def evaluate_journal(journal, candles, interval_minutes=5, now=None):
+    """Resolve OPEN records from closed bars only.
+
+    A record starts after its entry bar. Each bar is evaluated exactly once,
+    after it has closed, so a level touched later in that bar cannot be missed.
+    A bar that touches both levels is still counted as a loss.
+    """
+    candles = closed_candles(candles, f"{interval_minutes}min", now=now)
     if not candles:
         return journal
     changed = False
@@ -372,26 +476,57 @@ def evaluate_journal(journal, candles):
         last = rec.get("last_bar") or rec.get("entry_bar")
         if not last:
             continue
+        entry = rec.get("entry")
+        stop = rec.get("sl")
+        take = rec.get("tp")
+        if entry is None or stop is None or take is None:
+            continue
+        risk = abs(entry - stop)
+        mfe = float(rec.get("mfe") or 0.0)
+        mae = float(rec.get("mae") or 0.0)
+        resolved = False
         for c in candles:
             if c["time"] <= last:
                 continue
             last = c["time"]
-            if rec["direction"] in ("BUY", "LONG"):
-                if c["low"] <= rec["sl"]:
-                    rec["outcome"] = "SL"
-                elif c["high"] >= rec["tp"]:
-                    rec["outcome"] = "TP"
+            if risk > 0 and entry is not None:
+                if rec["direction"] in ("BUY", "LONG"):
+                    mfe = max(mfe, (c["high"] - entry) / risk)
+                    mae = min(mae, (c["low"] - entry) / risk)
+                    if c["low"] <= stop:
+                        rec["outcome"] = "SL"
+                    elif c["high"] >= rec["tp"]:
+                        rec["outcome"] = "TP"
+                else:
+                    mfe = max(mfe, (entry - c["low"]) / risk)
+                    mae = min(mae, (entry - c["high"]) / risk)
+                    if c["high"] >= stop:
+                        rec["outcome"] = "SL"
+                    elif c["low"] <= rec["tp"]:
+                        rec["outcome"] = "TP"
             else:
-                if c["high"] >= rec["sl"]:
-                    rec["outcome"] = "SL"
-                elif c["low"] <= rec["tp"]:
-                    rec["outcome"] = "TP"
+                if rec["direction"] in ("BUY", "LONG"):
+                    if c["low"] <= stop:
+                        rec["outcome"] = "SL"
+                    elif c["high"] >= rec["tp"]:
+                        rec["outcome"] = "TP"
+                else:
+                    if c["high"] >= stop:
+                        rec["outcome"] = "SL"
+                    elif c["low"] <= rec["tp"]:
+                        rec["outcome"] = "TP"
             if rec["outcome"] != "OPEN":
-                rec["closed_ts"] = time.time()
+                rec["closed_ts"] = bar_close_ts(c["time"], interval_minutes) or time.time()
+                resolved = True
                 break
         rec["last_bar"] = last
+        if risk > 0:
+            rec["mfe"] = round(mfe, 4)
+            rec["mae"] = round(mae, 4)
         db_update_signal(rec)
         changed = True
+        if resolved:
+            continue
     if changed:
         save_journal(journal)
     return journal
@@ -417,6 +552,10 @@ def journal_stats(journal, recent=8):
             stats["open"] += 1
             continue
         if rec.get("outcome") not in ("TP", "SL"):
+            continue
+        # A record without an entry bar was resolved by the old pre-entry scan;
+        # its first touch is not verifiable, so it must not pollute the hit rate.
+        if not rec.get("entry_bar"):
             continue
         closed.append(rec)
         stats["closed"] += 1
@@ -615,6 +754,8 @@ def cmd_status():
     st      = stats_cache or journal_stats(journal)
     rate    = hit_rate({"tp": st["tp"], "sl": st["sl"]})
     et      = datetime.now(NY)
+    heat    = portfolio_heat(journal)
+    day_r   = realized_r_today(journal)
     send_telegram(
         f"📊 <b>Status</b>\n"
         f"🕐 {datetime.now(IST).strftime('%d %b %H:%M')} IST | {et.strftime('%H:%M')} ET\n"
@@ -624,6 +765,8 @@ def cmd_status():
         f"🤖 AI: {'on — ' + OPENROUTER_MODEL.split('/')[-1] if AI_ENABLED else 'off'}\n"
         f"🔔 Alerts: {'paused' if alerts_paused else 'active'}\n"
         f"🎯 Signals (last {SIGNAL_WINDOW_HOURS:g}h): {len(prune_state(signals_sent))}\n"
+        f"🛡 Risk: {len(open_positions(journal))}/{MAX_OPEN_POSITIONS} open | "
+        f"heat ${heat:.2f} | today {day_r:+.1f}R\n"
         f"📈 Journal: {st['closed']} closed, {st['open']} open"
         + (f", {rate}% hit" if rate is not None else "")
     )
@@ -633,6 +776,8 @@ def ai_calibration(journal):
     buckets = {}
     for rec in journal:
         if rec.get("outcome") not in ("TP", "SL"):
+            continue
+        if not rec.get("entry_bar"):
             continue
         key = rec.get("ai_verdict") or "no AI"
         buckets.setdefault(key, {"tp": 0, "sl": 0})["tp" if rec["outcome"] == "TP" else "sl"] += 1
@@ -672,7 +817,10 @@ def cmd_journal():
         when      = datetime.fromtimestamp(rec["ts"], IST).strftime("%d %b %H:%M")
         direction = "BUY" if rec.get("direction") in ("BUY", "LONG") else "SELL"
         ai        = f" | AI {rec['ai_verdict']}" if rec.get("ai_verdict") else ""
-        lines.append(f"{icons.get(rec.get('outcome'), '•')} {when} {direction} "
+        icon = icons.get(rec.get("outcome"), "•")
+        if rec.get("outcome") in ("TP", "SL") and not rec.get("entry_bar"):
+            icon = "⚠️"
+        lines.append(f"{icon} {when} {direction} "
                      f"@ {rec.get('entry')} conf {rec.get('confidence')}%{ai}")
     send_telegram("\n".join(lines))
 
@@ -705,6 +853,9 @@ def cmd_settings():
         f"Min confidence: {MIN_CONFIDENCE}%\n"
         f"Signal cap: {cap}\n"
         f"Same-direction cooldown: {SAME_DIRECTION_COOLDOWN // 60}m\n"
+        f"Risk/trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:g}% of ${CAPITAL:.0f})\n"
+        f"Max open: {MAX_OPEN_POSITIONS} | heat cap: {MAX_PORTFOLIO_HEAT_PCT*100:g}%\n"
+        f"Daily loss stop: {DAILY_LOSS_LIMIT_R:.1f}R | weekend blackout: {WEEKEND_BLACKOUT_HOURS:g}h\n"
         f"Paper mode: {PAPER_MODE}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
         f"DB: {db_backend()}"
@@ -1230,12 +1381,13 @@ def calculate_lots(sl_dollars):
     if sl_dollars <= 0:
         return 0.01, 0, False
     raw_lots = (RISK_AMOUNT / sl_dollars) * 0.01
-    lots     = round(raw_lots, 2)
+    # Floor, not round: rounding 0.019 up to 0.02 silently doubles a small bet.
+    lots     = math.floor(raw_lots * 100) / 100
     if lots < 0.01:
-        return 0.01, round(sl_dollars * 1.0, 2), False
+        return 0.01, round(sl_dollars * 1.0, 2), sl_dollars <= RISK_AMOUNT * MAX_RISK_MULTIPLE
     lots        = min(lots, 0.50)
     actual_risk = sl_dollars * (lots / 0.01) * USD_PER_DOLLAR_MOVE_PER_001_LOT
-    is_safe     = actual_risk <= RISK_AMOUNT * 2.0
+    is_safe     = actual_risk <= RISK_AMOUNT * MAX_RISK_MULTIPLE
     return lots, round(actual_risk, 2), is_safe
 
 # ============================================
@@ -1399,10 +1551,6 @@ def generate_signal(candles_5m, candles_15m):
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
 
-    if not is_safe:
-        print(f"Signal rejected: risk ${actual_risk:.2f} too high.")
-        return None
-
     return {
         "signal":        signal,
         "price":         curr_price,
@@ -1410,6 +1558,7 @@ def generate_signal(candles_5m, candles_15m):
         "tp_dollars":    round(tp_dollars, 2),
         "lots":          lots,
         "potential_loss": actual_risk,
+        "risk_safe":     is_safe,
         "confidence":    score,
         "reasons":       reasons,
         "rsi":           rsi,
@@ -1534,6 +1683,71 @@ def market_closed(now=None):
         return True
     return n.hour == 17                     # daily settlement break
 
+def entry_blackout(now=None):
+    """Reason a new entry should not be opened, or None.
+
+    The weekly close and the daily settlement break are hard gaps: a position
+    opened minutes before them is held through the gap with no chance to work.
+    """
+    n = (now or datetime.now(NY)).astimezone(NY)
+    if n.weekday() == 4:
+        cutoff = 17 - WEEKEND_BLACKOUT_HOURS
+        if cutoff <= n.hour < 17:
+            return f"weekend close in <{WEEKEND_BLACKOUT_HOURS:g}h"
+    if n.weekday() < 4 and n.hour == 16 and n.minute >= 60 - DAILY_BREAK_BLACKOUT_MINUTES:
+        return f"daily settlement break in <{DAILY_BREAK_BLACKOUT_MINUTES}min"
+    return None
+
+def open_positions(journal):
+    return [rec for rec in journal if rec.get("outcome") == "OPEN"]
+
+def position_risk_usd(rec):
+    """Actual dollar risk for an open alert, from the stored sizing when present."""
+    stored = rec.get("risk_usd")
+    if stored is not None:
+        try:
+            return float(stored)
+        except (TypeError, ValueError):
+            pass
+    sl_dollars = abs((rec.get("entry") or 0) - (rec.get("sl") or 0))
+    if sl_dollars <= 0:
+        return 0.0
+    return calculate_lots(sl_dollars)[1]
+
+def portfolio_heat(journal):
+    return sum(position_risk_usd(rec) for rec in open_positions(journal))
+
+def risk_gate(journal, sig):
+    """Return a human-readable reason to block a new signal, or None."""
+    if not sig.get("risk_safe", True):
+        limit = RISK_AMOUNT * MAX_RISK_MULTIPLE
+        return (f"min-lot risk ${float(sig.get('potential_loss') or 0):.2f} "
+                f"> ${limit:.2f}")
+    if len(open_positions(journal)) >= MAX_OPEN_POSITIONS:
+        return f"max {MAX_OPEN_POSITIONS} open position(s)"
+    heat = portfolio_heat(journal)
+    new_risk = float(sig.get("potential_loss") or 0)
+    cap = CAPITAL * MAX_PORTFOLIO_HEAT_PCT
+    if heat + new_risk > cap + 1e-9:
+        return f"portfolio heat ${heat + new_risk:.2f} > ${cap:.2f}"
+    return None
+
+def realized_r_today(journal, now=None):
+    """Closed R for the current IST day, used as a daily loss brake."""
+    today = (now or datetime.now(IST)).astimezone(IST).date()
+    total = 0.0
+    for rec in journal:
+        if rec.get("outcome") not in ("TP", "SL"):
+            continue
+        stamp = rec.get("closed_ts") or rec.get("ts")
+        try:
+            closed_day = datetime.fromtimestamp(float(stamp), IST).date()
+        except (TypeError, ValueError, OSError):
+            continue
+        if closed_day == today:
+            total += 2.0 if rec["outcome"] == "TP" else -1.0
+    return total
+
 # ============================================
 # MAIN LOOP
 # ============================================
@@ -1543,8 +1757,11 @@ def main():
     signals_sent = load_state()
 
     print("🚀 XAUUSD SMC Bot Starting...")
-    print(f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f} | "
+    print(f"Capital: ${CAPITAL:.2f} | Risk/trade: ${RISK_AMOUNT:.2f} | "
           f"Min Confidence: {MIN_CONFIDENCE}%")
+    print(f"Risk controls: max {MAX_OPEN_POSITIONS} open | heat "
+          f"{MAX_PORTFOLIO_HEAT_PCT*100:.0f}% | daily stop {DAILY_LOSS_LIMIT_R:.1f}R | "
+          f"weekend blackout {WEEKEND_BLACKOUT_HOURS:g}h")
     print(f"Paper mode: {PAPER_MODE}")
     print(f"Data: {', '.join(provider_names()) or 'NONE configured'}")
     quota_line = (f"{MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling)"
@@ -1617,16 +1834,16 @@ def main():
                 continue
 
             print("Fetching candles...")
-            candles_5m = get_candles("5min", 100)
+            candles_5m = closed_candles(get_candles("5min", 100), "5min")
             time.sleep(3)
-            candles_15m = get_candles("15min", 100)
+            candles_15m = closed_candles(get_candles("15min", 100), "15min")
 
             if not candles_5m or not candles_15m:
                 print("Fetch failed. Retry in 2min...")
                 time.sleep(120)
                 continue
 
-            journal = evaluate_journal(journal, candles_5m)
+            journal = evaluate_journal(journal, candles_5m, interval_minutes=5)
             stats   = journal_stats(journal)
             db_save_bars(candles_5m, "5min")
             db_save_bars(candles_15m, "15min")
@@ -1637,8 +1854,17 @@ def main():
             if sig:
                 now_ts = time.time()
                 wait = same_direction_wait(signals_sent, sig["signal"], now_ts)
+                blackout = entry_blackout()
+                day_r = realized_r_today(journal)
+                gate = risk_gate(journal, sig)
                 if alerts_paused:
                     print(f"⏸ Paused — {sig['signal']} @ {sig['price']} not sent.")
+                elif blackout:
+                    print(f"⏸ Entry blackout ({blackout}) — {sig['signal']} "
+                          f"@ {sig['price']} not sent.")
+                elif day_r <= -DAILY_LOSS_LIMIT_R:
+                    print(f"⏸ Daily loss limit ({day_r:+.1f}R) — {sig['signal']} "
+                          f"@ {sig['price']} not sent.")
                 elif wait > 0:
                     print(f"{sig['signal']} within {SAME_DIRECTION_COOLDOWN // 60}min "
                           f"of the last {sig['signal']} — skipping ({wait}s left).")
@@ -1647,11 +1873,14 @@ def main():
                           f"{sig['signal']} @ {sig['price']} | "
                           f"conf {sig['confidence']}% | next slot in "
                           f"{format_wait(signals_sent, now_ts)}")
+                elif gate:
+                    print(f"⏸ Risk gate ({gate}) — {sig['signal']} @ {sig['price']} not sent.")
                 else:
                     send_signal(sig, candles_5m)
                     ai_started = time.time()
                     opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
-                    journal = record_signal(journal, sig, opinion, candles_5m[-1]["time"])
+                    journal = record_signal(journal, sig, opinion,
+                                            candles_5m[-1]["time"], now_ts)
                     if opinion:
                         send_ai_opinion(sig, opinion, stats)
                         db_save_ai_review(journal[-1], OPENROUTER_MODEL, opinion,

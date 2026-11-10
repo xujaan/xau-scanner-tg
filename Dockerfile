@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py chart.py ./
+COPY bot.py chart.py reconcile.py ./
 
 RUN useradd --create-home --uid 10001 bot && chown -R bot:bot /app
 USER bot

@@ -47,11 +47,13 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 
 ## ✨ Key Features
 
-- **Dynamic Lot Sizing**: Strictly adheres to a predefined risk profile (e.g., exactly 3% of capital per trade).
+- **Dynamic Lot Sizing**: Uses a conservative risk profile (default **2%** of capital per trade). Lots are floored, not rounded up, and a setup whose minimum 0.01 lot would risk more than `2×` the target is rejected.
 - **Capital Adequacy Checks**: Gold is volatile. The bot mathematically verifies if your account balance can handle the minimum lot size for a specific setup's stop-loss. If the risk is too high, it dynamically rejects the trade.
+- **Portfolio Guards**: At most one open signal by default, a total heat cap (default 4% of capital), a daily loss brake (default 3R), and a blackout before the Friday close and the daily settlement break.
+- **Journal Integrity**: Only closed candles are evaluated, each bar is processed once after it closes, and every alert stores its entry timestamp, actual risk, MFE and MAE. Records without an entry bar are marked unverified, excluded from hit-rate stats, and reported by `reconcile.py`.
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
-- **No Signal Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown that suppresses a repeated setup.
+- **No Calendar Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown plus the portfolio risk guards and daily loss brake.
 - **TwelveData by Default**: Candles come from TwelveData. An OANDA v20 practice account is supported but stays switched off until you explicitly enable it with `DATA_PROVIDER=oanda`.
 - **Durable Archive (Turso/libSQL or SQLite)**: Closed candles are stored once per timeframe, every alert with its outcome, and every AI review — so hit rates can be rebuilt after a redeploy instead of resetting. Turso is used when `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set, otherwise a local SQLite file.
 - **Signal Journal**: Every alert is recorded with its SL/TP and later resolved to TP or SL from the candles that follow, giving real hit rates per direction and confidence band instead of guesswork.
@@ -97,9 +99,9 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 3. **Configure the script:**
    Inside `bot.py`, locate the Configuration block and update your risk settings:
    ```python
-   CAPITAL = 100               # Your exact real balance
-   RISK_PERCENT = 0.03         # 3% risk per trade
-   MIN_CONFIDENCE = 80         # Strict 80%+ confluence required
+   CAPITAL = 200               # Your exact real balance
+   RISK_PERCENT = 0.02         # 2% risk per trade
+   MIN_CONFIDENCE = 65         # Strict 65%+ confluence required
    PAPER_MODE = True           # Set False ONLY when ready for live execution
    ```
 
@@ -114,6 +116,13 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
    ```bash
    python bot.py
    ```
+
+5. **Audit old journal outcomes (optional but recommended after an upgrade):**
+   ```bash
+   python reconcile.py            # dry run, prints every outcome that would change
+   python reconcile.py --apply    # write the rebuilt outcomes
+   ```
+   This rebuilds first-touch TP/SL from the stored closed bars. Records without an `entry_bar` are reported as unverifiable and are left untouched.
 
 ---
 
@@ -134,6 +143,14 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `MAX_TRADES_PER_DAY` | Optional. Max signals in any rolling window; `0` (default) = unlimited. |
 | `SIGNAL_WINDOW_HOURS` | Optional. Rolling window length in hours, used only when a cap is set (default `24`). |
 | `STATE_FILE` | Optional. File used to persist signal history (default `signal_state.json`). |
+| `CAPITAL` | Optional. Account balance used for sizing (default `200`). |
+| `RISK_PERCENT` | Optional. Target risk per signal as a fraction (default `0.02` = 2%). |
+| `MAX_RISK_MULTIPLE` | Optional. Reject a signal when the minimum lot would risk more than this multiple of the target (default `2.0`). |
+| `MAX_OPEN_POSITIONS` | Optional. Maximum concurrent open alerts (default `1`). |
+| `MAX_PORTFOLIO_HEAT_PCT` | Optional. Total open risk as a fraction of capital (default `0.04` = 4%). |
+| `DAILY_LOSS_LIMIT_R` | Optional. Stop sending new alerts after this many closed R today (default `3.0`). |
+| `WEEKEND_BLACKOUT_HOURS` | Optional. No new entries this many hours before the Friday close (default `2`). |
+| `DAILY_BREAK_BLACKOUT_MINUTES` | Optional. No new entries this many minutes before the daily settlement break (default `30`). |
 | `OPENROUTER_API_KEY` | Optional. Enables the AI second opinion. Without it the AI layer stays off. |
 | `OPENROUTER_MODEL` | Optional. Default `deepseek/deepseek-v4.1-flash-1017`. Pin a dated snapshot ID. |
 | `AI_TIMEOUT` | Optional. Seconds before the AI call is abandoned (default `20`). |
