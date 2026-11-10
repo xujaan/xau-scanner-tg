@@ -181,7 +181,9 @@ def make_filters(names):
 
 
 def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
-        max_bars=288, cooldown=2700, min_confidence=None, spread=0.0):
+        max_bars=288, cooldown=2700, min_confidence=None, spread=0.0,
+        pullback_atr=None, pullback_bars=3, delay_bars=0,
+        momentum_guard_atr=None, require_choch=False):
     """Replay the engine bar by bar with no lookahead."""
     if min_confidence is not None:
         bot.MIN_CONFIDENCE = min_confidence
@@ -214,8 +216,22 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
                "hour": time.gmtime(now).tm_hour}
         if not all(f(sig, ctx) for f in active):
             continue
+        if require_choch and not sig.get("choch"):
+            continue
+        if momentum_guard_atr and ctx["atr"] and i >= 12:
+            move = bars5[i]["close"] - bars5[i - 12]["close"]
+            limit = momentum_guard_atr * ctx["atr"]
+            if direction == "LONG" and move > limit:
+                continue
+            if direction == "SHORT" and move < -limit:
+                continue
 
         risk = atr_stop * ctx["atr"] if (atr_stop and ctx["atr"]) else sig["sl_dollars"]
+        entry = sig["price"]
+        sl = entry - risk if direction == "LONG" else entry + risk
+        tp = entry + rr * risk if direction == "LONG" else entry - rr * risk
+        start = i + 1
+
         if limit_entry:
             level = sig["ob_low"] if direction == "LONG" else sig["ob_high"]
             if level is None:
@@ -230,20 +246,38 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
             risk = abs(entry - sl)
             tp = entry + rr * risk if direction == "LONG" else entry - rr * risk
             start = fill + 1
-        else:
-            entry = sig["price"]
+        elif pullback_atr is not None:
+            if not ctx["atr"]:
+                continue
+            offset = pullback_atr * ctx["atr"]
+            level = entry - offset if direction == "LONG" else entry + offset
+            if (direction == "LONG" and level <= sl) or (direction == "SHORT" and level >= sl):
+                continue
+            fill = fill_limit(bars5, i + 1, direction, level,
+                              validity=pullback_bars)
+            if fill is None:
+                unfilled += 1
+                last_sent[direction] = now
+                continue
+            entry = level
+            start = fill + 1
+        elif delay_bars:
+            entry_idx = i + delay_bars
+            if entry_idx >= len(bars5) - 1:
+                continue
+            entry = bars5[entry_idx]["close"]
             sl = entry - risk if direction == "LONG" else entry + risk
             tp = entry + rr * risk if direction == "LONG" else entry - rr * risk
-            start = i + 1
+            start = entry_idx + 1
 
         outcome, r = resolve(bars5, start, direction, entry, sl, tp, max_bars)
         # Spread and slippage cost a fixed price amount per trade, so a tight
         # stop pays more of it in R terms than a wide one.
-        if spread and risk > 0:
-            r -= spread / risk
+        if spread and abs(entry - sl) > 0:
+            r -= spread / abs(entry - sl)
         last_sent[direction] = now
         trades.append({"ts": now, "direction": direction, "outcome": outcome,
-                       "r": r, "risk": round(risk, 2), "rsi": sig["rsi"],
+                       "r": r, "risk": round(abs(entry - sl), 2), "rsi": sig["rsi"],
                        "confidence": sig["confidence"]})
 
     return summarise(trades, generated, unfilled)
@@ -292,6 +326,13 @@ VARIANTS = [
                                      filters=("session", "extension"))),
     ("limit at OB edge", dict(rr=2.0, limit_entry=True)),
     ("limit + RSI guard", dict(rr=2.0, limit_entry=True, filters=("rsi",))),
+    # P2 entry-timing experiments. These are research-only; live defaults are
+    # unchanged until the shadow sample earns a promotion.
+    ("pullback 0.25 ATR", dict(rr=2.0, pullback_atr=0.25, pullback_bars=3)),
+    ("pullback 0.50 ATR", dict(rr=2.0, pullback_atr=0.50, pullback_bars=3)),
+    ("delay 1 bar", dict(rr=2.0, delay_bars=1)),
+    ("momentum guard 2ATR", dict(rr=2.0, momentum_guard_atr=2.0)),
+    ("CHoCH only", dict(rr=2.0, require_choch=True)),
 ]
 
 

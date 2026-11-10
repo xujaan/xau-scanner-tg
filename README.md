@@ -126,6 +126,17 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
    ```
    This rebuilds first-touch TP/SL from the stored closed bars. Records without an `entry_bar` are reported as unverifiable and are left untouched.
 
+### Research / backtest
+
+The live engine is replayed over cached Yahoo GC=F 5m bars:
+
+```bash
+python backtest.py --spread 0.20
+python backtest.py --spread 0.20 --only "baseline;pullback 0.25;delay"
+```
+
+P2 entry-timing experiments (`pullback 0.25/0.50 ATR`, `delay 1 bar`, `momentum guard`, `CHoCH only`) live only in `backtest.py`; they are not live defaults. Use two date ranges (`--start` / `--end`) before treating any variant as stable.
+
 ---
 
 ## 🔑 Environment Variables
