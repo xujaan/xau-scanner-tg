@@ -75,11 +75,18 @@ SHADOW_MIN_ATR  = float(os.environ.get("SHADOW_MIN_ATR", 4.0))
 SHADOW_SPREAD   = float(os.environ.get("SHADOW_SPREAD", 0.20))
 SHADOW_VARIANTS = (
     ("baseline",   {}),
+    ("vol_high",   {"min_atr": SHADOW_MIN_ATR}),
     ("long_only",  {"direction": "LONG"}),
     ("short_only", {"direction": "SHORT"}),
     ("short_vol",  {"direction": "SHORT", "min_atr": SHADOW_MIN_ATR}),
     ("no_asia",    {"exclude_utc_hours": (4, 5, 6)}),
 )
+
+# Live volatility floor. The 41-trade live sample and the 70-day replay both
+# showed the same thing: low-ATR chop is where the engine bleeds. This gate sits
+# in the live path only; the research harness keeps the raw baseline so the
+# filter can still be compared honestly.
+MIN_ENTRY_ATR = float(os.environ.get("MIN_ENTRY_ATR", 4.0))
 
 # Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
 # window. 0 (the default) means no cap at all — the same-direction cooldown below is
@@ -1026,6 +1033,7 @@ def cmd_settings():
         f"Risk/trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:g}% of ${CAPITAL:.0f})\n"
         f"Max open: {MAX_OPEN_POSITIONS} | heat cap: {MAX_PORTFOLIO_HEAT_PCT*100:g}%\n"
         f"Daily loss stop: {DAILY_LOSS_LIMIT_R:.1f}R | weekend blackout: {WEEKEND_BLACKOUT_HOURS:g}h\n"
+        f"Min entry ATR: {MIN_ENTRY_ATR:g} | shadow min ATR: {SHADOW_MIN_ATR:g}\n"
         f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz\n"
         f"Paper mode: {PAPER_MODE}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
@@ -1896,6 +1904,10 @@ def risk_gate(journal, sig):
         limit = RISK_AMOUNT * MAX_RISK_MULTIPLE
         return (f"min-lot risk ${float(sig.get('potential_loss') or 0):.2f} "
                 f"> ${limit:.2f}")
+    atr = sig.get("atr")
+    if MIN_ENTRY_ATR > 0 and (atr is None or atr < MIN_ENTRY_ATR):
+        atr_txt = "n/a" if atr is None else f"{atr:.2f}"
+        return f"ATR {atr_txt} < {MIN_ENTRY_ATR:g}"
     if len(open_positions(journal)) >= MAX_OPEN_POSITIONS:
         return f"max {MAX_OPEN_POSITIONS} open position(s)"
     heat = portfolio_heat(journal)
@@ -1934,7 +1946,8 @@ def main():
           f"Min Confidence: {MIN_CONFIDENCE}%")
     print(f"Risk controls: max {MAX_OPEN_POSITIONS} open | heat "
           f"{MAX_PORTFOLIO_HEAT_PCT*100:.0f}% | daily stop {DAILY_LOSS_LIMIT_R:.1f}R | "
-          f"weekend blackout {WEEKEND_BLACKOUT_HOURS:g}h")
+          f"weekend blackout {WEEKEND_BLACKOUT_HOURS:g}h | "
+          f"min ATR {MIN_ENTRY_ATR:g}")
     print(f"Paper mode: {PAPER_MODE}")
     print(f"Data: {', '.join(provider_names()) or 'NONE configured'}")
     quota_line = (f"{MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling)"

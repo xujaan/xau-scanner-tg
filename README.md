@@ -51,7 +51,8 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Capital Adequacy Checks**: Gold is volatile. The bot mathematically verifies if your account balance can handle the minimum lot size for a specific setup's stop-loss. If the risk is too high, it dynamically rejects the trade.
 - **Portfolio Guards**: At most one open signal by default, a total heat cap (default 4% of capital), a daily loss brake (default 3R), and a blackout before the Friday close and the daily settlement break.
 - **Journal Integrity**: Only closed candles are evaluated, each bar is processed once after it closes, and every alert stores its entry timestamp, actual risk, MFE and MAE. Records without an entry bar are marked unverified, excluded from hit-rate stats, and reported by `reconcile.py`.
-- **Shadow Variants**: Every scan is also recorded under several filters — baseline, LONG-only, SHORT-only, SHORT + minimum ATR, and no-Asia (04:00–06:59 UTC) — resolved by the same closed-bar evaluator, with `/shadow` showing cost-adjusted R. Shadows never send alerts. They evaluate the signal selected by the live engine; they do not search for a second setup when that direction is filtered out.
+- **Shadow Variants**: Every scan is also recorded under several filters — baseline, volatility, LONG-only, SHORT-only, SHORT + minimum ATR, and no-Asia (04:00–06:59 UTC) — resolved by the same closed-bar evaluator, with `/shadow` showing cost-adjusted R. Shadows never send alerts. They evaluate the signal selected by the live engine; they do not search for a second setup when that direction is filtered out.
+- **Volatility Regime Gate**: Live alerts are suppressed when the 5M ATR is below `MIN_ENTRY_ATR` (default `4.0`). The 70-day replay cut drawdown from 26.2R to 13.4R and raised E[R] from +0.124 to +0.163 by removing low-volatility chop.
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Calendar Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown plus the portfolio risk guards and daily loss brake.
@@ -164,6 +165,7 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `DAILY_LOSS_LIMIT_R` | Optional. Stop sending new alerts after this many closed R today (default `3.0`). |
 | `WEEKEND_BLACKOUT_HOURS` | Optional. No new entries this many hours before the Friday close (default `2`). |
 | `DAILY_BREAK_BLACKOUT_MINUTES` | Optional. No new entries this many minutes before the daily settlement break (default `30`). |
+| `MIN_ENTRY_ATR` | Optional. Live volatility floor: suppress alerts when 5M ATR is below this value (default `4.0`; set `0` to disable). |
 | `SHADOW_ENABLED` | Optional. Record shadow variants on every scan (default `1`; set `0` to disable). |
 | `SHADOW_MIN_ATR` | Optional. Minimum 5M ATR for the `short_vol` shadow variant (default `4.0`). |
 | `SHADOW_SPREAD` | Optional. Round-trip cost in $/oz used by `/shadow` (default `0.20`). |

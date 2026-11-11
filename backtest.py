@@ -169,6 +169,24 @@ def make_filters(names):
         # Gold trends in the London/NY overlap; the Asian range chops.
         return 7 <= ctx["hour"] < 17
 
+    def session_7_21(sig, ctx):
+        return 7 <= ctx["hour"] < 21
+
+    def no_0407(sig, ctx):
+        return ctx["hour"] not in (4, 5, 6)
+
+    def atr4(sig, ctx):
+        return ctx["atr"] is not None and ctx["atr"] >= 4.0
+
+    def atr5(sig, ctx):
+        return ctx["atr"] is not None and ctx["atr"] >= 5.0
+
+    def short_only(sig, ctx):
+        return sig["signal"] == "SHORT"
+
+    def long_only(sig, ctx):
+        return sig["signal"] == "LONG"
+
     def extension(sig, ctx):
         # Do not enter a move that is already stretched from its mean.
         if ctx["ema"] is None or ctx["atr"] is None:
@@ -176,14 +194,17 @@ def make_filters(names):
         return abs(sig["price"] - ctx["ema"]) <= 1.5 * ctx["atr"]
 
     available = {"rsi": rsi_guard, "sl_cap": sl_cap, "ob_edge": ob_edge,
-                 "session": session, "extension": extension}
+                 "session": session, "extension": extension,
+                 "session_7_21": session_7_21, "no_0407": no_0407,
+                 "atr4": atr4, "atr5": atr5, "short": short_only,
+                 "long": long_only}
     return [available[n] for n in names]
 
 
 def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
         max_bars=288, cooldown=2700, min_confidence=None, spread=0.0,
         pullback_atr=None, pullback_bars=3, delay_bars=0,
-        momentum_guard_atr=None, require_choch=False):
+        momentum_guard_atr=None, require_choch=False, global_cooldown=0):
     """Replay the engine bar by bar with no lookahead."""
     if min_confidence is not None:
         bot.MIN_CONFIDENCE = min_confidence
@@ -191,6 +212,7 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
     active = make_filters(filters)
     closed_at = [b["closed_at"] for b in bars15]
     last_sent = {}
+    last_any = 0
     trades, generated, unfilled = [], 0, 0
 
     for i in range(100, len(bars5) - 1):
@@ -208,6 +230,8 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
 
         direction = "LONG" if sig["signal"] == "LONG" else "SHORT"
         if now - last_sent.get(direction, 0) < cooldown:
+            continue
+        if global_cooldown and now - last_any < global_cooldown:
             continue
 
         window = bars5[max(0, i - 60):i + 1]
@@ -240,6 +264,7 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
             if fill is None:
                 unfilled += 1
                 last_sent[direction] = now
+                last_any = now
                 continue
             entry = level
             sl = entry - 1.0 if direction == "LONG" else entry + 1.0
@@ -258,6 +283,7 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
             if fill is None:
                 unfilled += 1
                 last_sent[direction] = now
+                last_any = now
                 continue
             entry = level
             start = fill + 1
@@ -276,6 +302,7 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
         if spread and abs(entry - sl) > 0:
             r -= spread / abs(entry - sl)
         last_sent[direction] = now
+        last_any = now
         trades.append({"ts": now, "direction": direction, "outcome": outcome,
                        "r": r, "risk": round(abs(entry - sl), 2), "rsi": sig["rsi"],
                        "confidence": sig["confidence"]})
@@ -333,6 +360,18 @@ VARIANTS = [
     ("delay 1 bar", dict(rr=2.0, delay_bars=1)),
     ("momentum guard 2ATR", dict(rr=2.0, momentum_guard_atr=2.0)),
     ("CHoCH only", dict(rr=2.0, require_choch=True)),
+    # Regime filters: these are the closest thing to a safe "overhaul" because
+    # they only remove trades from the existing engine.
+    ("+ ATR >= 4", dict(rr=2.0, filters=("atr4",))),
+    ("+ ATR >= 5", dict(rr=2.0, filters=("atr5",))),
+    ("+ session 07-21", dict(rr=2.0, filters=("session_7_21",))),
+    ("+ no 04-07 UTC", dict(rr=2.0, filters=("no_0407",))),
+    ("+ ATR4 + session 07-21", dict(rr=2.0, filters=("atr4", "session_7_21"))),
+    ("+ short only", dict(rr=2.0, filters=("short",))),
+    ("+ short + ATR4", dict(rr=2.0, filters=("short", "atr4"))),
+    ("+ long only", dict(rr=2.0, filters=("long",))),
+    ("+ long + ATR4", dict(rr=2.0, filters=("long", "atr4"))),
+    ("global cooldown 45m", dict(rr=2.0, global_cooldown=2700)),
 ]
 
 
