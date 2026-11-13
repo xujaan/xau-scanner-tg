@@ -59,8 +59,8 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **TwelveData by Default**: Candles come from TwelveData. An OANDA v20 practice account is supported but stays switched off until you explicitly enable it with `DATA_PROVIDER=oanda`.
 - **Durable Archive (Turso/libSQL or SQLite)**: Closed candles are stored once per timeframe, every alert with its outcome, and every AI review — so hit rates can be rebuilt after a redeploy instead of resetting. Turso is used when `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set, otherwise a local SQLite file.
 - **Signal Journal**: Every alert is recorded with its SL/TP and later resolved to TP or SL from the candles that follow, giving real hit rates per direction and confidence band instead of guesswork.
-- **AI Second Opinion**: When `OPENROUTER_API_KEY` is set, a second Telegram message carries an LLM review of the rule signal (verdict, confidence, reasons) informed by those hit rates. The AI never changes entry/SL/TP and a failed AI call never blocks the alert.
-- **Telegram Commands**: `/scan` for an immediate scan, plus `/price`, `/status`, `/stats`, `/journal`, `/settings`, `/pause`, `/resume` and `/help`. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
+- **AI Second Opinion**: When `OPENROUTER_API_KEY` is set, a second Telegram message carries an LLM review of the rule signal (verdict, confidence, reasons) informed by those hit rates. The AI never changes entry/SL/TP and a failed AI call never blocks the alert. Empty or null model content is retried once before the review is skipped.
+- **Telegram Commands**: `/scan` for an immediate scan, plus `/price`, `/status`, `/stats`, `/shadow`, `/checkpoint`, `/journal`, `/settings`, `/pause`, `/resume` and `/help`. Only messages from `TELEGRAM_CHAT_ID` are accepted, and outside market hours the bot replies that the market is closed.
 
 ### Telegram commands
 
@@ -71,6 +71,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 | `/status` | Market open/closed, data provider, DB backend, AI state, alerts paused | – |
 | `/stats` | Hit rate overall, per direction, per confidence band, and per AI verdict | – |
 | `/shadow` | Compare shadow variants (baseline, long/short-only, volatility, no-Asia) with cost-adjusted R | – |
+| `/checkpoint` | Progress toward the 100-trade review: live WR/E[R]/DD and shadow closed counts | – |
 | `/journal` | Last 5 alerts with TP / SL / OPEN outcome | – |
 | `/settings` | Active configuration (provider, cap, cooldown, model) | – |
 | `/pause`, `/resume` | Stop and resume alert sending; scanning continues | – |

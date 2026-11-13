@@ -708,6 +708,18 @@ def hit_rate(bucket):
     total = bucket["tp"] + bucket["sl"]
     return None if not total else round(100 * bucket["tp"] / total)
 
+def max_drawdown_r(journal):
+    """Peak-to-trough drawdown in R for verified closed records."""
+    equity = peak = worst = 0.0
+    rows = sorted((r for r in journal
+                   if r.get("entry_bar") and r.get("outcome") in ("TP", "SL")),
+                  key=lambda r: r.get("closed_ts") or r.get("ts") or 0)
+    for rec in rows:
+        equity += 2.0 if rec["outcome"] == "TP" else -1.0
+        peak = max(peak, equity)
+        worst = max(worst, peak - equity)
+    return worst
+
 def journal_stats(journal, recent=8):
     """Hit rates the AI is given as context, so 'learning' means data, not vibes."""
     stats = {"closed": 0, "tp": 0, "sl": 0, "open": 0,
@@ -761,6 +773,43 @@ AI_OPINION_SCHEMA = {
     },
 }
 
+def _ai_message_content(data):
+    """Pull text out of an OpenRouter response, tolerating null/array content."""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not choices:
+        return None, "no choices"
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        content = "".join(parts)
+    if not isinstance(content, str) or not content.strip():
+        return None, f"finish={choice.get('finish_reason')} content={type(content).__name__}"
+    return content.strip(), None
+
+def _parse_ai_json(content):
+    """Accept plain JSON or a fenced/embedded JSON object."""
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+    return None
+
 def ai_second_opinion(sig, candles_5m, candles_15m, stats):
     """Ask the model to review the rule signal. Returns None on any failure —
     the alert has already been sent, so the AI must never block it."""
@@ -805,22 +854,42 @@ def ai_second_opinion(sig, candles_5m, candles_15m, stats):
         "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT},
                      {"role": "user", "content": json.dumps(payload)}],
         "temperature": 0.2,
-        "max_tokens": 400,
+        "max_tokens": 800,
+        # Keep the 5m signal fresh: do not let a reasoning pass eat the whole
+        # output budget and return content=null.
+        "reasoning": {"effort": "low"},
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "signal_opinion", "strict": True, "schema": AI_OPINION_SCHEMA}},
     }
-    try:
-        r = requests.post("https://openrouter.ai/api/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                                   "Content-Type": "application/json"},
-                          json=body, timeout=AI_TIMEOUT)
-        if r.status_code != 200:
-            print(f"AI error {r.status_code}: {r.text[:200]}")
+    content = None
+    for attempt in (1, 2):
+        request_body = dict(body)
+        if attempt == 2:
+            # A provider can return an empty content field even with a valid
+            # schema request. Ask once more without the schema constraint.
+            request_body.pop("response_format", None)
+            request_body["max_tokens"] = 600
+        try:
+            r = requests.post("https://openrouter.ai/api/v1/chat/completions",
+                              headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                                       "Content-Type": "application/json"},
+                              json=request_body, timeout=AI_TIMEOUT)
+            if r.status_code != 200:
+                print(f"AI error {r.status_code}: {r.text[:200]}")
+                return None
+            data = r.json()
+        except Exception as e:
+            print(f"AI call failed: {e}")
             return None
-        content = r.json()["choices"][0]["message"]["content"]
-        opinion = json.loads(content)
-    except Exception as e:
-        print(f"AI call failed: {e}")
+        content, reason = _ai_message_content(data)
+        if content:
+            break
+        print(f"AI empty response (attempt {attempt}, {reason})")
+    if not content:
+        return None
+    opinion = _parse_ai_json(content)
+    if opinion is None:
+        print(f"AI returned non-JSON content: {content[:120]!r}")
         return None
     return validate_opinion(opinion)
 
@@ -910,6 +979,7 @@ def cmd_help():
         "/status — market, alerts, storage and AI state\n"
         "/stats — hit rate and AI calibration\n"
         "/shadow — compare shadow strategy variants\n"
+        "/checkpoint — progress toward the 100-trade review\n"
         "/journal — last 5 alerts with outcomes\n"
         "/settings — active configuration\n"
         "/pause — stop sending alerts\n"
@@ -1001,6 +1071,30 @@ def cmd_shadow():
         return
     send_telegram(shadow_report_text())
 
+def cmd_checkpoint():
+    journal = journal_cache or []
+    st = stats_cache or journal_stats(journal)
+    tp, sl = st["tp"], st["sl"]
+    closed = tp + sl
+    wr = 100.0 * tp / closed if closed else 0.0
+    e_r = (2.0 * tp - sl) / closed if closed else 0.0
+    dd = max_drawdown_r(journal)
+    lines = [
+        "📌 <b>Checkpoint</b>",
+        f"Live: <b>{closed}/100</b> clean closed | WR {wr:.1f}% | "
+        f"E[R] {e_r:+.3f}R | DD {dd:.1f}R",
+    ]
+    if SHADOW_ENABLED:
+        sh = shadow_stats(shadow_cache or [])
+        lines.append("Shadow:")
+        for variant, _rules in SHADOW_VARIANTS:
+            s = sh[variant]
+            lines.append(f"• {variant}: {s['closed']}/100 | "
+                         f"WR {s['wr']:.0f}% | net {s['net_total_r']:+.1f}R")
+    lines.append("")
+    lines.append("Target: WR ≥34% | net E[R] ≥+0.03R | DD ≤20R")
+    send_telegram("\n".join(lines))
+
 def cmd_price():
     send_telegram("🔄 Fetching price...")
     candles    = get_candles("5min", 60)
@@ -1055,6 +1149,7 @@ COMMAND_HANDLERS = {
     "/status":   cmd_status,
     "/stats":    cmd_stats,
     "/shadow":   cmd_shadow,
+    "/checkpoint": cmd_checkpoint,
     "/journal":  cmd_journal,
     "/price":    cmd_price,
     "/settings": cmd_settings,
