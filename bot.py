@@ -81,6 +81,8 @@ SHADOW_VARIANTS = (
     ("short_vol",  {"direction": "SHORT", "min_atr": SHADOW_MIN_ATR}),
     ("no_asia",    {"exclude_utc_hours": (4, 5, 6)}),
     ("conf_70_79", {"confidence_min": 70, "confidence_max": 79}),
+    ("htf_ema",    {"require_htf_ema": True}),
+    ("htf_ema_short", {"require_htf_ema": True, "direction": "SHORT"}),
 )
 
 # Live volatility floor. The 41-trade live sample and the 70-day replay both
@@ -623,6 +625,15 @@ def shadow_variant_allows(rules, sig, now_ts):
         return False
     if cmax is not None and confidence > cmax:
         return False
+    if rules.get("require_htf_ema"):
+        fast = sig.get("ema15_fast")
+        slow = sig.get("ema15_slow")
+        if fast is None or slow is None:
+            return False
+        if sig.get("signal") == "LONG" and fast <= slow:
+            return False
+        if sig.get("signal") == "SHORT" and fast >= slow:
+            return False
     excluded = rules.get("exclude_utc_hours") or ()
     if excluded and datetime.fromtimestamp(now_ts, pytz.UTC).hour in excluded:
         return False
@@ -1652,6 +1663,16 @@ def calculate_atr(candles, period=14):
                           abs(cur["low"] - prev["close"])))
     return sum(ranges) / period
 
+def ema_last(values, period):
+    """Latest EMA of a close series; None when history is short."""
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    current = sum(values[:period]) / period
+    for value in values[period:]:
+        current = value * k + current * (1 - k)
+    return current
+
 def four_hour_return(candles, bars=48):
     """Percent move over the last `bars` 5m candles; None when history is short."""
     if len(candles) < bars + 1:
@@ -1867,6 +1888,9 @@ def generate_signal(candles_5m, candles_15m):
     tp_dollars = sl_dollars * 2
 
     lots, actual_risk, is_safe = calculate_lots(sl_dollars)
+    closes_15 = [c["close"] for c in candles_15m]
+    ema15_fast = ema_last(closes_15, 20)
+    ema15_slow = ema_last(closes_15, 50)
 
     return {
         "signal":        signal,
@@ -1877,6 +1901,8 @@ def generate_signal(candles_5m, candles_15m):
         "potential_loss": actual_risk,
         "risk_safe":     is_safe,
         "atr":           atr,
+        "ema15_fast":    ema15_fast,
+        "ema15_slow":    ema15_slow,
         "confidence":    score,
         "reasons":       reasons,
         "rsi":           rsi,
