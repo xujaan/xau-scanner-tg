@@ -187,6 +187,9 @@ def make_filters(names):
     def long_only(sig, ctx):
         return sig["signal"] == "LONG"
 
+    def conf_70_79(sig, ctx):
+        return 70 <= sig.get("confidence", 0) <= 79
+
     def extension(sig, ctx):
         # Do not enter a move that is already stretched from its mean.
         if ctx["ema"] is None or ctx["atr"] is None:
@@ -197,7 +200,7 @@ def make_filters(names):
                  "session": session, "extension": extension,
                  "session_7_21": session_7_21, "no_0407": no_0407,
                  "atr4": atr4, "atr5": atr5, "short": short_only,
-                 "long": long_only}
+                 "long": long_only, "conf_70_79": conf_70_79}
     return [available[n] for n in names]
 
 
@@ -371,6 +374,7 @@ VARIANTS = [
     ("+ short + ATR4", dict(rr=2.0, filters=("short", "atr4"))),
     ("+ long only", dict(rr=2.0, filters=("long",))),
     ("+ long + ATR4", dict(rr=2.0, filters=("long", "atr4"))),
+    ("+ conf 70-79", dict(rr=2.0, filters=("conf_70_79",))),
     ("global cooldown 45m", dict(rr=2.0, global_cooldown=2700)),
 ]
 

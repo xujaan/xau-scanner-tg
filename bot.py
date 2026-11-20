@@ -80,6 +80,7 @@ SHADOW_VARIANTS = (
     ("short_only", {"direction": "SHORT"}),
     ("short_vol",  {"direction": "SHORT", "min_atr": SHADOW_MIN_ATR}),
     ("no_asia",    {"exclude_utc_hours": (4, 5, 6)}),
+    ("conf_70_79", {"confidence_min": 70, "confidence_max": 79}),
 )
 
 # Live volatility floor. The 41-trade live sample and the 70-day replay both
@@ -606,6 +607,13 @@ def shadow_variant_allows(rules, sig, now_ts):
     atr = sig.get("atr")
     if min_atr is not None and (atr is None or atr < min_atr):
         return False
+    cmin = rules.get("confidence_min")
+    cmax = rules.get("confidence_max")
+    confidence = sig.get("confidence") or 0
+    if cmin is not None and confidence < cmin:
+        return False
+    if cmax is not None and confidence > cmax:
+        return False
     excluded = rules.get("exclude_utc_hours") or ()
     if excluded and datetime.fromtimestamp(now_ts, pytz.UTC).hour in excluded:
         return False
@@ -854,10 +862,11 @@ def ai_second_opinion(sig, candles_5m, candles_15m, stats):
         "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT},
                      {"role": "user", "content": json.dumps(payload)}],
         "temperature": 0.2,
-        "max_tokens": 800,
-        # Keep the 5m signal fresh: do not let a reasoning pass eat the whole
-        # output budget and return content=null.
-        "reasoning": {"effort": "low"},
+        "max_tokens": 2000,
+        # This model can spend the entire output budget on hidden reasoning and
+        # return content=null with finish_reason=length. The review is short and
+        # latency-sensitive, so disable the reasoning pass for this call.
+        "reasoning": {"enabled": False},
         "response_format": {"type": "json_schema", "json_schema": {
             "name": "signal_opinion", "strict": True, "schema": AI_OPINION_SCHEMA}},
     }
@@ -868,7 +877,6 @@ def ai_second_opinion(sig, candles_5m, candles_15m, stats):
             # A provider can return an empty content field even with a valid
             # schema request. Ask once more without the schema constraint.
             request_body.pop("response_format", None)
-            request_body["max_tokens"] = 600
         try:
             r = requests.post("https://openrouter.ai/api/v1/chat/completions",
                               headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
