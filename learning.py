@@ -88,7 +88,7 @@ def champion_row(ranking):
     return ranking[0] if ranking else None
 
 
-def recommendation(ranking):
+def recommendation(ranking, bias=None):
     champ = champion_row(ranking)
     if not champ:
         return {"decision": "collect", "variant": "none",
@@ -106,6 +106,17 @@ def recommendation(ranking):
     if best is None:
         return {"decision": "keep", "variant": champ["variant"],
                 "reason": "Belum ada challenger dengan sampel cukup."}
+    bias = bias or {}
+    if (best["variant"] in ("short_only", "short_vol")
+            and bias.get("long", {}).get("closed", 0) < 20):
+        return {
+            "decision": "keep",
+            "variant": champ["variant"],
+            "challenger": best["variant"],
+            "reason": (f"{best['variant']} unggul, tapi sampel shadow masih "
+                       f"short-heavy (LONG hanya {bias.get('long', {}).get('closed', 0)}). "
+                       "Jangan promosikan filter arah dari satu regime."),
+        }
     dd_limit = max(champ["max_dd"] * 1.25, champ["max_dd"] + 1.0)
     if (best["net_e_r"] >= champ["net_e_r"] + 0.05
             and best["max_dd"] <= dd_limit):
@@ -142,12 +153,13 @@ def direction_bias(shadow):
 
 def build_context(journal, shadow):
     ranking = shadow_ranking(shadow)
+    bias = direction_bias(shadow)
     return {
         "live": live_summary(journal),
         "champion": champion_row(ranking),
         "ranking": ranking,
-        "recommendation": recommendation(ranking),
-        "direction_bias": direction_bias(shadow),
+        "recommendation": recommendation(ranking, bias),
+        "direction_bias": bias,
         "filters": {
             "min_entry_atr": bot.MIN_ENTRY_ATR,
             "max_open_positions": bot.MAX_OPEN_POSITIONS,
