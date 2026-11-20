@@ -53,7 +53,7 @@ The bot scores potential trade setups out of 100 based on multiple confluences:
 - **Journal Integrity**: Only closed candles are evaluated, each bar is processed once after it closes, and every alert stores its entry timestamp, actual risk, MFE and MAE. Records without an entry bar are marked unverified, excluded from hit-rate stats, and reported by `reconcile.py`.
 - **Shadow Variants**: Every scan is also recorded under several filters — baseline, volatility, LONG-only, SHORT-only, SHORT + minimum ATR, no-Asia (04:00–06:59 UTC), confidence 70–79, 15M EMA trend, and 15M EMA + SHORT — resolved by the same closed-bar evaluator, with `/shadow` showing cost-adjusted R. Shadows never send alerts. They evaluate the signal selected by the live engine; they do not search for a second setup when that direction is filtered out.
 - **Volatility Regime Gate**: Live alerts are suppressed when the 5M ATR is below `MIN_ENTRY_ATR` (default `4.0`). The 70-day replay cut drawdown from 26.2R to 13.4R and raised E[R] from +0.124 to +0.163 by removing low-volatility chop.
-- **Bounded Self-Learning**: `/learn` ranks the shadow variants against the live champion using net E[R] and drawdown, with a minimum sample before promotion. `/learnai` sends the aggregate live/shadow/regime summary to the AI for a post-mortem and one bounded recommendation. The AI cannot invent parameters or auto-apply changes; promotion remains a deliberate config change.
+- **Bounded Self-Learning**: `/learn` ranks the shadow variants against the live champion using net E[R] and drawdown, with a minimum sample before promotion. `/learnai` sends the aggregate live/shadow/regime summary to the AI for a post-mortem and one bounded recommendation. The AI cannot invent parameters or auto-apply changes; promotion remains a deliberate config change. Auto-promotion is opt-in, waits for 100 closed shadow trades, requires a two-direction sample for direction filters, and has a 14-day cooldown.
 - **Paper Trading Mode**: Safety-first testing. Generates "Paper Signals" for forward-testing without risking live capital.
 - **Session Awareness**: Operates aware of Asian, London, and New York overlapping sessions.
 - **No Calendar Cap**: Every qualifying setup is alerted — there is no calendar-day quota to run out of, only a 45-minute same-direction cooldown plus the portfolio risk guards and daily loss brake.
@@ -177,6 +177,9 @@ To keep your credentials secure, do **not** hardcode them. Export these environm
 | `LEARNING_MIN_TRADES` | Optional. Minimum closed shadow trades before a variant can be promoted (default `50`). |
 | `LEARNING_AI` | Optional. Let the bot request a bounded AI post-mortem (default `1`). |
 | `LEARNING_AI_HOURS` | Optional. Minimum hours between automatic AI reviews (default `24`). |
+| `LEARNING_AUTO_PROMOTE` | Optional. Allow a qualified challenger to replace the live policy automatically (default `0`). |
+| `LEARNING_LIVE_MIN_TRADES` | Optional. Closed shadow trades required before auto-promotion (default `100`). |
+| `POLICY_PROMOTION_COOLDOWN_HOURS` | Optional. Minimum hours between automatic policy changes (default `336` = 14 days). |
 | `OPENROUTER_API_KEY` | Optional. Enables the AI second opinion. Without it the AI layer stays off. |
 | `OPENROUTER_MODEL` | Optional. Default `deepseek/deepseek-v4.1-flash-1017`. Pin a dated snapshot ID. |
 | `AI_TIMEOUT` | Optional. Seconds before the AI call is abandoned (default `20`). |

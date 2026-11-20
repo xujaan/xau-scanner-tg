@@ -82,8 +82,11 @@ def shadow_ranking(shadow):
 
 
 def champion_row(ranking):
+    current = CHAMPION
+    if bot.active_policy and bot.active_policy.get("variant"):
+        current = bot.active_policy["variant"]
     for row in ranking:
-        if row["variant"] == CHAMPION:
+        if row["variant"] == current:
             return row
     return ranking[0] if ranking else None
 
@@ -166,7 +169,10 @@ def build_context(journal, shadow):
             "max_portfolio_heat_pct": bot.MAX_PORTFOLIO_HEAT_PCT,
             "risk_percent": bot.RISK_PERCENT,
             "min_trades_for_promotion": bot.LEARNING_MIN_TRADES,
+            "live_min_trades": bot.LEARNING_LIVE_MIN_TRADES,
+            "auto_promote": bot.LEARNING_AUTO_PROMOTE,
         },
+        "active_policy": bot.active_policy,
         "spread": bot.SHADOW_SPREAD,
     }
 
@@ -257,6 +263,78 @@ def run_ai_review(journal, shadow):
     return opinion
 
 
+def policy_for(variant):
+    """Map a shadow variant to the live policy it would promote."""
+    base = {
+        "direction": "both",
+        "min_atr": 0.0,
+        "confidence_min": None,
+        "confidence_max": None,
+        "exclude_utc_hours": [],
+        "require_htf_ema": False,
+    }
+    if variant in ("vol_high", "short_vol"):
+        base["min_atr"] = bot.SHADOW_MIN_ATR
+    if variant in ("short_only", "short_vol", "htf_ema_short"):
+        base["direction"] = "SHORT"
+    if variant == "long_only":
+        base["direction"] = "LONG"
+    if variant == "no_asia":
+        base["exclude_utc_hours"] = [4, 5, 6]
+    if variant == "conf_70_79":
+        base["confidence_min"] = 70
+        base["confidence_max"] = 79
+    if variant in ("htf_ema", "htf_ema_short"):
+        base["require_htf_ema"] = True
+    if variant not in CATALOG:
+        return None
+    base["variant"] = variant
+    return base
+
+
+def apply_policy(variant, source="manual"):
+    policy = policy_for(variant)
+    if not policy:
+        return None
+    policy["updated_ts"] = time.time()
+    policy["source"] = source
+    bot.db_save_policy(policy)
+    bot.active_policy = policy
+    bot.db_run([("INSERT INTO learning_log (ts, kind, payload) VALUES (?,?,?)",
+                 (policy["updated_ts"], "promotion", json.dumps(policy)))])
+    bot.send_telegram(
+        f"🧠 <b>Policy promoted</b>\n"
+        f"Variant: <b>{variant}</b>\n"
+        f"ATR ≥ {policy['min_atr']:g} | direction {policy['direction']} | "
+        f"confidence {policy.get('confidence_min') or 0}–"
+        f"{policy.get('confidence_max') or 100}\n"
+        f"Source: {source}"
+    )
+    return policy
+
+
+def maybe_auto_promote(journal, shadow):
+    if not (bot.LEARNING_ENABLED and bot.LEARNING_AUTO_PROMOTE):
+        return None
+    ranking = shadow_ranking(shadow)
+    bias = direction_bias(shadow)
+    rec = recommendation(ranking, bias)
+    if rec.get("decision") != "promote":
+        return None
+    best = next((r for r in ranking if r["variant"] == rec.get("variant")), None)
+    champ = champion_row(ranking)
+    if not best or not champ:
+        return None
+    if (best["closed"] < bot.LEARNING_LIVE_MIN_TRADES
+            or champ["closed"] < bot.LEARNING_LIVE_MIN_TRADES):
+        return None
+    current = bot.db_load_policy()
+    if current and time.time() - float(current.get("updated_ts") or 0) < (
+            bot.POLICY_PROMOTION_COOLDOWN_HOURS * 3600):
+        return None
+    return apply_policy(best["variant"], source="auto-learning")
+
+
 def maybe_auto_review(journal, shadow):
     global _last_attempt
     if not (bot.LEARNING_ENABLED and bot.LEARNING_AI and bot.AI_ENABLED):
@@ -312,6 +390,15 @@ def report_text(journal, shadow):
                      f"WR {row['wr']:.0f}% | net {row['net_total_r']:+.1f}R | "
                      f"DD {row['max_dd']:.1f}R")
     lines.append("")
+    if bot.active_policy:
+        p = bot.active_policy
+        lines.append(f"<b>Active policy:</b> {p.get('variant')} | "
+                     f"ATR≥{p.get('min_atr', 0):g} | dir {p.get('direction', 'both')} | "
+                     f"source {p.get('source', '?')}")
+    else:
+        lines.append("<b>Active policy:</b> env defaults")
+    lines.append(f"<b>Auto-promote:</b> {'on' if bot.LEARNING_AUTO_PROMOTE else 'off'} "
+                 f"(live min {bot.LEARNING_LIVE_MIN_TRADES})")
     lines.append(f"<b>Rule:</b> {rec['decision']} — {rec['reason']}")
     last = last_ai_review()
     if last:

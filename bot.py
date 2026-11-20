@@ -97,6 +97,10 @@ LEARNING_ENABLED    = os.environ.get("LEARNING_ENABLED", "1").strip().lower() no
 LEARNING_MIN_TRADES = int(os.environ.get("LEARNING_MIN_TRADES", 50))
 LEARNING_AI         = os.environ.get("LEARNING_AI", "1").strip().lower() not in ("0", "false", "no", "off")
 LEARNING_AI_HOURS   = float(os.environ.get("LEARNING_AI_HOURS", 24))
+LEARNING_AUTO_PROMOTE = os.environ.get("LEARNING_AUTO_PROMOTE", "0").strip().lower() not in ("0", "false", "no", "off")
+LEARNING_LIVE_MIN_TRADES = int(os.environ.get("LEARNING_LIVE_MIN_TRADES", 100))
+POLICY_PROMOTION_COOLDOWN_HOURS = float(os.environ.get("POLICY_PROMOTION_COOLDOWN_HOURS", 336))
+active_policy = None
 
 # Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
 # window. 0 (the default) means no cap at all — the same-direction cooldown below is
@@ -239,6 +243,10 @@ DB_SCHEMA = [
          UNIQUE(variant, ts, direction))""",
     """CREATE TABLE IF NOT EXISTS learning_log (
          ts REAL NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS active_policy (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         variant TEXT NOT NULL, payload TEXT NOT NULL,
+         updated_ts REAL NOT NULL, source TEXT)""",
 ]
 
 def db_backend():
@@ -417,6 +425,26 @@ def db_load_shadow_journal(limit=5000):
                     "risk_usd, mfe, mae FROM shadow_signals "
                     "ORDER BY ts DESC LIMIT ?", (limit,))], fetch=True)
     return [dict(zip(SHADOW_COLUMNS, row)) for row in reversed(rows)]
+
+def db_load_policy():
+    rows = db_run([("SELECT variant, payload, updated_ts, source FROM active_policy "
+                    "WHERE id=1", ())], fetch=True)
+    if not rows:
+        return None
+    try:
+        policy = json.loads(rows[0][1])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    policy["updated_ts"] = rows[0][2]
+    policy["source"] = rows[0][3]
+    policy.setdefault("variant", rows[0][0])
+    return policy
+
+def db_save_policy(policy):
+    db_run([("INSERT OR REPLACE INTO active_policy "
+             "(id, variant, payload, updated_ts, source) VALUES (1,?,?,?,?)",
+             (policy["variant"], json.dumps(policy), policy["updated_ts"],
+              policy.get("source")))])
 
 # ============================================
 # SIGNAL JOURNAL  (every alert, and how it resolved)
@@ -1179,6 +1207,8 @@ def cmd_settings():
         f"Min entry ATR: {MIN_ENTRY_ATR:g} | shadow min ATR: {SHADOW_MIN_ATR:g}\n"
         f"Learning: {'on' if LEARNING_ENABLED else 'off'} | min {LEARNING_MIN_TRADES} | "
         f"AI review {'on' if LEARNING_AI else 'off'} every {LEARNING_AI_HOURS:g}h\n"
+        f"Policy: {active_policy.get('variant') if active_policy else 'env defaults'} | "
+        f"auto-promote {'on' if LEARNING_AUTO_PROMOTE else 'off'}\n"
         f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz\n"
         f"Paper mode: {PAPER_MODE}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
@@ -2061,16 +2091,55 @@ def position_risk_usd(rec):
 def portfolio_heat(journal):
     return sum(position_risk_usd(rec) for rec in open_positions(journal))
 
-def risk_gate(journal, sig):
+def policy_gate(sig, now_ts=None):
+    """Apply the promoted champion policy, if one exists."""
+    policy = active_policy
+    if not policy:
+        return None
+    direction = str(policy.get("direction", "both")).upper()
+    if direction not in ("BOTH", "LONG", "SHORT"):
+        direction = "BOTH"
+    if direction != "BOTH" and sig.get("signal") != direction:
+        return f"policy direction {direction}"
+    min_atr = float(policy.get("min_atr") or 0)
+    atr = sig.get("atr")
+    if min_atr > 0 and (atr is None or atr < min_atr):
+        atr_txt = "n/a" if atr is None else f"{atr:.2f}"
+        return f"policy ATR {atr_txt} < {min_atr:g}"
+    cmin = policy.get("confidence_min")
+    cmax = policy.get("confidence_max")
+    confidence = sig.get("confidence") or 0
+    if cmin is not None and confidence < cmin:
+        return f"policy confidence {confidence} < {cmin}"
+    if cmax is not None and confidence > cmax:
+        return f"policy confidence {confidence} > {cmax}"
+    hour = datetime.fromtimestamp(now_ts or time.time(), pytz.UTC).hour
+    if hour in (policy.get("exclude_utc_hours") or []):
+        return f"policy excludes {hour:02d}:00 UTC"
+    if policy.get("require_htf_ema"):
+        fast, slow = sig.get("ema15_fast"), sig.get("ema15_slow")
+        if fast is None or slow is None:
+            return "policy HTF EMA unavailable"
+        if sig.get("signal") == "LONG" and fast <= slow:
+            return "policy HTF EMA against LONG"
+        if sig.get("signal") == "SHORT" and fast >= slow:
+            return "policy HTF EMA against SHORT"
+    return None
+
+def risk_gate(journal, sig, now_ts=None):
     """Return a human-readable reason to block a new signal, or None."""
     if not sig.get("risk_safe", True):
         limit = RISK_AMOUNT * MAX_RISK_MULTIPLE
         return (f"min-lot risk ${float(sig.get('potential_loss') or 0):.2f} "
                 f"> ${limit:.2f}")
-    atr = sig.get("atr")
-    if MIN_ENTRY_ATR > 0 and (atr is None or atr < MIN_ENTRY_ATR):
-        atr_txt = "n/a" if atr is None else f"{atr:.2f}"
-        return f"ATR {atr_txt} < {MIN_ENTRY_ATR:g}"
+    policy_reason = policy_gate(sig, now_ts)
+    if policy_reason:
+        return policy_reason
+    if active_policy is None:
+        atr = sig.get("atr")
+        if MIN_ENTRY_ATR > 0 and (atr is None or atr < MIN_ENTRY_ATR):
+            atr_txt = "n/a" if atr is None else f"{atr:.2f}"
+            return f"ATR {atr_txt} < {MIN_ENTRY_ATR:g}"
     if len(open_positions(journal)) >= MAX_OPEN_POSITIONS:
         return f"max {MAX_OPEN_POSITIONS} open position(s)"
     heat = portfolio_heat(journal)
@@ -2100,7 +2169,7 @@ def realized_r_today(journal, now=None):
 # MAIN LOOP
 # ============================================
 def main():
-    global signals_sent, journal_cache, stats_cache, shadow_cache
+    global signals_sent, journal_cache, stats_cache, shadow_cache, active_policy
 
     signals_sent = load_state()
 
@@ -2119,6 +2188,14 @@ def main():
     print(f"Quota: {quota_line} | {len(signals_sent)} loaded from {STATE_FILE}")
 
     db_init()
+    active_policy = db_load_policy()
+    if active_policy:
+        print(f"Policy: {active_policy.get('variant')} | "
+              f"ATR>={active_policy.get('min_atr', 0):g} | "
+              f"dir={active_policy.get('direction', 'both')} | "
+              f"source={active_policy.get('source', '?')}")
+    else:
+        print("Policy: env defaults (no promoted champion)")
     journal = db_load_journal()
     if not journal:
         legacy = load_journal()
@@ -2140,7 +2217,9 @@ def main():
           f"min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz")
     print(f"Learning: {'on' if LEARNING_ENABLED else 'off'} | "
           f"min sample {LEARNING_MIN_TRADES} | "
-          f"AI review {'on' if LEARNING_AI else 'off'} every {LEARNING_AI_HOURS:g}h")
+          f"AI review {'on' if LEARNING_AI else 'off'} every {LEARNING_AI_HOURS:g}h | "
+          f"auto-promote {'on' if LEARNING_AUTO_PROMOTE else 'off'} "
+          f"(live min {LEARNING_LIVE_MIN_TRADES})")
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
     scan_event = threading.Event()
@@ -2210,6 +2289,7 @@ def main():
             if LEARNING_ENABLED:
                 import learning
                 learning.maybe_auto_review(journal, shadow)
+                learning.maybe_auto_promote(journal, shadow)
 
             sig = generate_signal(candles_5m, candles_15m)
 
@@ -2222,7 +2302,7 @@ def main():
                 wait = same_direction_wait(signals_sent, sig["signal"], now_ts)
                 blackout = entry_blackout()
                 day_r = realized_r_today(journal)
-                gate = risk_gate(journal, sig)
+                gate = risk_gate(journal, sig, now_ts)
                 if alerts_paused:
                     print(f"⏸ Paused — {sig['signal']} @ {sig['price']} not sent.")
                 elif blackout:

@@ -84,6 +84,12 @@ spec:
               value: "1"
             - name: LEARNING_AI_HOURS
               value: "24"
+            - name: LEARNING_AUTO_PROMOTE
+              value: "1"
+            - name: LEARNING_LIVE_MIN_TRADES
+              value: "100"
+            - name: POLICY_PROMOTION_COOLDOWN_HOURS
+              value: "336"
           resources:
             requests:
               cpu: 50m
