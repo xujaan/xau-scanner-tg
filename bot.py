@@ -89,6 +89,13 @@ SHADOW_VARIANTS = (
 # filter can still be compared honestly.
 MIN_ENTRY_ATR = float(os.environ.get("MIN_ENTRY_ATR", 4.0))
 
+# Bounded self-learning: statistics decide what is eligible, AI writes a
+# post-mortem and a recommendation, but nothing is auto-applied to live.
+LEARNING_ENABLED    = os.environ.get("LEARNING_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+LEARNING_MIN_TRADES = int(os.environ.get("LEARNING_MIN_TRADES", 50))
+LEARNING_AI         = os.environ.get("LEARNING_AI", "1").strip().lower() not in ("0", "false", "no", "off")
+LEARNING_AI_HOURS   = float(os.environ.get("LEARNING_AI_HOURS", 24))
+
 # Optional rolling quota: at most MAX_TRADES_PER_DAY signals in any SIGNAL_WINDOW_HOURS
 # window. 0 (the default) means no cap at all — the same-direction cooldown below is
 # then the only throttle. No midnight reset either way.
@@ -228,6 +235,8 @@ DB_SCHEMA = [
          outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
          entry_bar TEXT, entry_ts REAL, risk_usd REAL, mfe REAL, mae REAL,
          UNIQUE(variant, ts, direction))""",
+    """CREATE TABLE IF NOT EXISTS learning_log (
+         ts REAL NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL)""",
 ]
 
 def db_backend():
@@ -988,6 +997,8 @@ def cmd_help():
         "/stats — hit rate and AI calibration\n"
         "/shadow — compare shadow strategy variants\n"
         "/checkpoint — progress toward the 100-trade review\n"
+        "/learn — champion/challenger ranking and rule\n"
+        "/learnai — run an AI post-mortem now\n"
         "/journal — last 5 alerts with outcomes\n"
         "/settings — active configuration\n"
         "/pause — stop sending alerts\n"
@@ -1103,6 +1114,25 @@ def cmd_checkpoint():
     lines.append("Target: WR ≥34% | net E[R] ≥+0.03R | DD ≤20R")
     send_telegram("\n".join(lines))
 
+def cmd_learn():
+    if not LEARNING_ENABLED:
+        send_telegram("🧠 <b>Self-learning is off</b>\nSet LEARNING_ENABLED=1.")
+        return
+    import learning
+    send_telegram(learning.report_text(journal_cache or [], shadow_cache or []))
+
+def cmd_learnai():
+    if not LEARNING_ENABLED:
+        send_telegram("🧠 <b>Self-learning is off</b>\nSet LEARNING_ENABLED=1.")
+        return
+    if not AI_ENABLED:
+        send_telegram("🧠 <b>AI is off</b>\nSet OPENROUTER_API_KEY to use /learnai.")
+        return
+    import learning
+    send_telegram("🧠 <b>AI review running…</b>\nMengirim statistik live + shadow.")
+    opinion = learning.run_ai_review(journal_cache or [], shadow_cache or [])
+    send_telegram(learning.format_ai(opinion))
+
 def cmd_price():
     send_telegram("🔄 Fetching price...")
     candles    = get_candles("5min", 60)
@@ -1136,6 +1166,8 @@ def cmd_settings():
         f"Max open: {MAX_OPEN_POSITIONS} | heat cap: {MAX_PORTFOLIO_HEAT_PCT*100:g}%\n"
         f"Daily loss stop: {DAILY_LOSS_LIMIT_R:.1f}R | weekend blackout: {WEEKEND_BLACKOUT_HOURS:g}h\n"
         f"Min entry ATR: {MIN_ENTRY_ATR:g} | shadow min ATR: {SHADOW_MIN_ATR:g}\n"
+        f"Learning: {'on' if LEARNING_ENABLED else 'off'} | min {LEARNING_MIN_TRADES} | "
+        f"AI review {'on' if LEARNING_AI else 'off'} every {LEARNING_AI_HOURS:g}h\n"
         f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz\n"
         f"Paper mode: {PAPER_MODE}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
@@ -1158,6 +1190,8 @@ COMMAND_HANDLERS = {
     "/stats":    cmd_stats,
     "/shadow":   cmd_shadow,
     "/checkpoint": cmd_checkpoint,
+    "/learn":    cmd_learn,
+    "/learnai":  cmd_learnai,
     "/journal":  cmd_journal,
     "/price":    cmd_price,
     "/settings": cmd_settings,
@@ -2078,6 +2112,9 @@ def main():
     shadow_cache = shadow
     print(f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | {len(shadow)} records | "
           f"min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz")
+    print(f"Learning: {'on' if LEARNING_ENABLED else 'off'} | "
+          f"min sample {LEARNING_MIN_TRADES} | "
+          f"AI review {'on' if LEARNING_AI else 'off'} every {LEARNING_AI_HOURS:g}h")
     print(f"AI: {'on — ' + OPENROUTER_MODEL if AI_ENABLED else 'off (OPENROUTER_API_KEY not set)'}")
 
     scan_event = threading.Event()
@@ -2144,6 +2181,9 @@ def main():
             db_save_bars(candles_5m, "5min")
             db_save_bars(candles_15m, "15min")
             journal_cache, stats_cache = journal, stats
+            if LEARNING_ENABLED:
+                import learning
+                learning.maybe_auto_review(journal, shadow)
 
             sig = generate_signal(candles_5m, candles_15m)
 

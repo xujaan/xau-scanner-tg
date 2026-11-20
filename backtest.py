@@ -104,6 +104,19 @@ def atr(candles, period=14):
     return sum(ranges) / period
 
 
+def ema_series(values, period):
+    out = [None] * len(values)
+    if len(values) < period:
+        return out
+    k = 2.0 / (period + 1)
+    current = sum(values[:period]) / period
+    out[period - 1] = current
+    for i in range(period, len(values)):
+        current = values[i] * k + current * (1 - k)
+        out[i] = current
+    return out
+
+
 # ============================================
 # EXECUTION
 # ============================================
@@ -190,6 +203,15 @@ def make_filters(names):
     def conf_70_79(sig, ctx):
         return 70 <= sig.get("confidence", 0) <= 79
 
+    def conf_max_79(sig, ctx):
+        return sig.get("confidence", 0) <= 79
+
+    def htf_ema(sig, ctx):
+        fast, slow = ctx.get("ema15_fast"), ctx.get("ema15_slow")
+        if fast is None or slow is None:
+            return True
+        return fast > slow if sig["signal"] == "LONG" else fast < slow
+
     def extension(sig, ctx):
         # Do not enter a move that is already stretched from its mean.
         if ctx["ema"] is None or ctx["atr"] is None:
@@ -200,7 +222,8 @@ def make_filters(names):
                  "session": session, "extension": extension,
                  "session_7_21": session_7_21, "no_0407": no_0407,
                  "atr4": atr4, "atr5": atr5, "short": short_only,
-                 "long": long_only, "conf_70_79": conf_70_79}
+                 "long": long_only, "conf_70_79": conf_70_79,
+                 "conf_max_79": conf_max_79, "htf_ema": htf_ema}
     return [available[n] for n in names]
 
 
@@ -214,6 +237,8 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
 
     active = make_filters(filters)
     closed_at = [b["closed_at"] for b in bars15]
+    ema15_fast = ema_series([b["close"] for b in bars15], 20)
+    ema15_slow = ema_series([b["close"] for b in bars15], 50)
     last_sent = {}
     last_any = 0
     trades, generated, unfilled = [], 0, 0
@@ -240,7 +265,9 @@ def run(bars5, bars15, rr=2.0, filters=(), limit_entry=False, atr_stop=None,
         window = bars5[max(0, i - 60):i + 1]
         ctx = {"atr": atr(window),
                "ema": sum(c["close"] for c in window[-20:]) / 20 if len(window) >= 20 else None,
-               "hour": time.gmtime(now).tm_hour}
+               "hour": time.gmtime(now).tm_hour,
+               "ema15_fast": ema15_fast[upto - 1] if upto else None,
+               "ema15_slow": ema15_slow[upto - 1] if upto else None}
         if not all(f(sig, ctx) for f in active):
             continue
         if require_choch and not sig.get("choch"):
@@ -375,6 +402,10 @@ VARIANTS = [
     ("+ long only", dict(rr=2.0, filters=("long",))),
     ("+ long + ATR4", dict(rr=2.0, filters=("long", "atr4"))),
     ("+ conf 70-79", dict(rr=2.0, filters=("conf_70_79",))),
+    ("+ conf <= 79", dict(rr=2.0, filters=("conf_max_79",))),
+    ("+ 15M EMA trend", dict(rr=2.0, filters=("htf_ema",))),
+    ("+ 15M EMA + ATR4", dict(rr=2.0, filters=("htf_ema", "atr4"))),
+    ("+ 15M EMA + short", dict(rr=2.0, filters=("htf_ema", "short"))),
     ("global cooldown 45m", dict(rr=2.0, global_cooldown=2700)),
 ]
 

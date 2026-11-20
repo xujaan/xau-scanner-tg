@@ -76,6 +76,14 @@ spec:
               value: "4.0"
             - name: SHADOW_SPREAD
               value: "0.20"
+            - name: LEARNING_ENABLED
+              value: "1"
+            - name: LEARNING_MIN_TRADES
+              value: "50"
+            - name: LEARNING_AI
+              value: "1"
+            - name: LEARNING_AI_HOURS
+              value: "24"
           resources:
             requests:
               cpu: 50m
