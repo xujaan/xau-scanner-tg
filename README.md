@@ -32,6 +32,10 @@ When a confluence of signals aligns with strict risk-management parameters, it f
 
 ---
 
+> 📚 **Divergence deep-dive:** see [`docs/DIVERGENCE.md`](docs/DIVERGENCE.md)
+> for the full pattern taxonomy, detection rules, backtest tables, live config,
+> cent-account sizing, and caveats.
+
 ## ⚙️ Algorithmic Strategy
 
 The bot scores potential trade setups out of 100 based on multiple confluences:
