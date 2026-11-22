@@ -8,6 +8,8 @@ import threading
 import time
 from datetime import datetime
 import pytz
+import divergence
+import mt5_data
 try:
     from chart import build_signal_chart
 except Exception as _chart_err:
@@ -22,9 +24,18 @@ TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
 
-# TwelveData is the data source. OANDA v20 support is opt-in and inert until
-# DATA_PROVIDER=oanda is set, so no OANDA request is ever made by default.
-DATA_PROVIDER     = os.environ.get("DATA_PROVIDER", "twelvedata").strip().lower()
+# MT5 is the primary feed when its API key is configured: it is the broker's
+# own bid/ask, carries per-bar spread and volume, and matches execution. The
+# bridge stamps bars in broker server time, so mt5_data converts everything to
+# UTC before it reaches the engine. TwelveData remains a fallback.
+MT5_API_URL       = os.environ.get("MT5_API_URL", mt5_data.DEFAULT_BASE_URL)
+MT5_API_KEY       = os.environ.get("MT5_API_KEY")
+MT5_SYMBOL        = os.environ.get("MT5_SYMBOL", mt5_data.DEFAULT_SYMBOL)
+MT5_SERVER_TZ     = os.environ.get("MT5_SERVER_TZ", mt5_data.DEFAULT_SERVER_TZ)
+DATA_PROVIDER     = os.environ.get(
+    "DATA_PROVIDER",
+    "mt5" if MT5_API_KEY else "twelvedata",
+).strip().lower()
 OANDA_API_KEY     = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID  = os.environ.get("OANDA_ACCOUNT_ID")
 OANDA_ENV         = os.environ.get("OANDA_ENV", "practice").strip().lower()
@@ -49,7 +60,7 @@ SYMBOL       = "XAU/USD"
 CAPITAL      = float(os.environ.get("CAPITAL", 200))
 # Risk per signal. The old default was 5% ($10 on $200), which is far too much
 # for a $200 account when the minimum 0.01 lot can already risk more than that.
-RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 0.02))
+RISK_PERCENT = float(os.environ.get("RISK_PERCENT", 0.005))
 RISK_AMOUNT  = CAPITAL * RISK_PERCENT   # $4 at defaults
 
 # A signal is rejected when the smallest tradable lot would risk more than this
@@ -83,6 +94,88 @@ SHADOW_VARIANTS = (
     ("conf_70_79", {"confidence_min": 70, "confidence_max": 79}),
     ("htf_ema",    {"require_htf_ema": True}),
     ("htf_ema_short", {"require_htf_ema": True, "direction": "SHORT"}),
+    # Divergence variants. They evaluate the same live signal, so a row only
+    # exists when the signal and the divergence point the same way.
+    ("div_any",    {"require_divergence": True}),
+    ("div_regular", {"require_divergence": True,
+                     "divergence_types": ("regular",)}),
+    ("div_hidden", {"require_divergence": True,
+                    "divergence_types": ("hidden",)}),
+    ("div_stoch",  {"require_divergence": True,
+                    "divergence_oscillators": ("stoch_935",)}),
+    ("div_stoch_1433", {"require_divergence": True,
+                        "divergence_oscillators": ("stoch_1433",)}),
+    ("div_rsi",    {"require_divergence": True,
+                    "divergence_oscillators": ("rsi_",)}),
+    ("div_macd",   {"require_divergence": True,
+                    "divergence_oscillators": ("macd_hist",)}),
+    ("div_hidden_vol", {"require_divergence": True,
+                        "divergence_types": ("hidden",),
+                        "min_atr": SHADOW_MIN_ATR}),
+    ("ob_edge",    {"require_ob_edge": True}),
+    ("ob_edge_htf", {"require_ob_edge": True, "require_htf_ema": True}),
+    ("ob_edge_htf_div", {"require_ob_edge": True, "require_htf_ema": True,
+                         "require_divergence": True,
+                         "divergence_types": ("hidden",)}),
+    # Research hypotheses that came out of the divergence literature: higher-
+    # timeframe confirmation, trend strength, a Stochastic trigger, volume and
+    # freshness. Shadows never send anything; they only collect evidence.
+    ("div_15m",    {"require_divergence": True,
+                    "divergence_timeframe": "15m"}),
+    ("div_fresh",  {"require_divergence": True, "divergence_max_age": 5}),
+    ("div_strong", {"require_divergence": True,
+                    "divergence_min_strength": 3.0}),
+    ("div_obv",    {"require_divergence": True,
+                    "divergence_oscillators": ("obv",)}),
+    ("stoch_cross", {"require_stoch_cross": True}),
+    ("adx_20",     {"min_adx": 20.0}),
+    ("adx_25",     {"min_adx": 25.0}),
+    ("adx_lt20",   {"max_adx": 20.0}),
+    ("ob_edge_htf_div_15m", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "divergence_timeframe": "15m"}),
+    ("ob_edge_htf_div_adx20", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "min_adx": 20.0}),
+    ("ob_edge_htf_div_adx25", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "min_adx": 25.0}),
+    ("ob_edge_htf_div_stoch", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "require_stoch_cross": True}),
+    ("ob_edge_htf_div_obv", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "divergence_oscillators": ("obv",)}),
+    ("ob_edge_htf_div_fresh", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "divergence_max_age": 5}),
+    ("ob_edge_htf_div_strong", {
+        "require_ob_edge": True, "require_htf_ema": True,
+        "require_divergence": True, "divergence_types": ("hidden",),
+        "divergence_min_strength": 3.0}),
+)
+
+# Divergence is computed on every scan so the shadow rows and the backtest see
+# the same data. Live behaviour is unchanged by default ("shadow"). Set
+# DIVERGENCE_LIVE_MODE=bonus to add confluence points, or =filter to require a
+# divergence before an alert. Filter types are comma-separated; hidden
+# divergence is the safer default because it agrees with the 15M trend.
+STOCH_K          = int(os.environ.get("STOCH_K", 9))
+STOCH_D          = int(os.environ.get("STOCH_D", 3))
+STOCH_SMOOTH     = int(os.environ.get("STOCH_SMOOTH", 5))
+DIVERGENCE_ENABLED = os.environ.get("DIVERGENCE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+DIVERGENCE_LIVE_MODE = os.environ.get("DIVERGENCE_LIVE_MODE", "shadow").strip().lower()
+DIVERGENCE_BONUS = float(os.environ.get("DIVERGENCE_BONUS", 10))
+DIVERGENCE_FILTER_TYPES = tuple(
+    part.strip() for part in
+    os.environ.get("DIVERGENCE_FILTER_TYPES", "hidden").split(",")
+    if part.strip()
 )
 
 # Live volatility floor. The 41-trade live sample and the 70-day replay both
@@ -115,16 +208,40 @@ STATE_FILE              = os.environ.get("STATE_FILE", "signal_state.json")
 MIN_CONFIDENCE     = 65
 MIN_SL_DOLLARS     = 3.0
 MAX_SL_DOLLARS     = 20.0
-ATR_STOP_MULT      = 1.5    # SL distance in ATR(14) units
+ATR_STOP_MULT      = float(os.environ.get("ATR_STOP_MULT", 1.5))
+# Live policy defaults follow the 1-year MT5 replay: OB edge + 15M EMA +
+# hidden divergence + ATR4 + ADX20. The gates live in risk_gate(), after the
+# shadow logger has seen the raw signal, so baseline shadows remain comparable.
+REQUIRE_OB_EDGE    = os.environ.get("REQUIRE_OB_EDGE", "1").strip().lower() not in ("0", "false", "no", "off")
+REQUIRE_HTF_EMA    = os.environ.get("REQUIRE_HTF_EMA", "1").strip().lower() not in ("0", "false", "no", "off")
+REQUIRE_DIVERGENCE = os.environ.get("REQUIRE_DIVERGENCE", "1").strip().lower() not in ("0", "false", "no", "off")
+MIN_ADX            = float(os.environ.get("MIN_ADX", 20))
+MAX_ADX            = float(os.environ.get("MAX_ADX", 0))
 MAX_LONG_4H_MOVE   = 0.3    # percent — skip a LONG after a 4h run this large
 MIN_FVG_SIZE       = 1.50   # minimum FVG gap in dollars to count
 EQUAL_LEVEL_TOL    = 0.30   # dollars — how close two highs/lows must be to count as "equal"
 IST                = pytz.timezone('Asia/Kolkata')
 NY                 = pytz.timezone('America/New_York')
 
-PAPER_MODE = True
+PAPER_MODE = os.environ.get("PAPER_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
+EXECUTION_ENABLED = os.environ.get("EXECUTION_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+CENT_ACCOUNT = os.environ.get("CENT_ACCOUNT", "0").strip().lower() not in ("0", "false", "no", "off")
+ACCOUNT_SCALE = 100.0 if CENT_ACCOUNT else 1.0
 
-# Gold contract: 1.00 lot = 100oz → $1 move = $100/lot → $1 move = $1 per 0.01 lot
+def account_money(value):
+    """Display an account-currency amount in dollars.
+
+    A USC cent account stores 10,000.00 for $100.00; the risk engine keeps the
+    raw account-currency units and only this formatter divides by 100.
+    """
+    try:
+        return float(value) / ACCOUNT_SCALE
+    except (TypeError, ValueError):
+        return 0.0
+
+# XAU contract on a standard USD account: 1 lot = 100 oz, so $1 move = $100/lot
+# and $1 per 0.01 lot. On Headway's USC cent account the effective contract is
+# 1 oz/lot: $1 move = 1 USC per 0.01 lot, which is why CAPITAL stays in USC.
 USD_PER_DOLLAR_MOVE_PER_001_LOT = 1.0
 
 # ============================================
@@ -230,7 +347,7 @@ DB_SCHEMA = [
          direction TEXT NOT NULL, entry REAL, sl REAL, tp REAL, confidence INTEGER,
          outcome TEXT DEFAULT 'OPEN', closed_ts REAL, last_bar TEXT,
          entry_bar TEXT, entry_ts REAL, risk_usd REAL, mfe REAL, mae REAL,
-         ai_verdict TEXT, ai_confidence INTEGER)""",
+         ai_verdict TEXT, ai_confidence INTEGER, ticket INTEGER)""",
     """CREATE TABLE IF NOT EXISTS ai_reviews (
          ts REAL, model TEXT, verdict TEXT, confidence INTEGER,
          reasons TEXT, risk_note TEXT, latency_ms INTEGER)""",
@@ -324,6 +441,7 @@ SIGNAL_MIGRATIONS = (
     ("risk_usd", "REAL"),
     ("mfe", "REAL"),
     ("mae", "REAL"),
+    ("ticket", "INTEGER"),
 )
 
 def db_init():
@@ -348,13 +466,14 @@ def db_save_bars(candles, timeframe):
 def db_save_signal(rec):
     db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
              "closed_ts, last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
-             "ai_verdict, ai_confidence) "
-             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             "ai_verdict, ai_confidence, ticket) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (rec["ts"], rec["direction"], rec.get("entry"), rec.get("sl"), rec.get("tp"),
               rec.get("confidence"), rec.get("outcome", "OPEN"), rec.get("closed_ts"),
               rec.get("last_bar"), rec.get("entry_bar"), rec.get("entry_ts"),
               rec.get("risk_usd"), rec.get("mfe"), rec.get("mae"),
-              rec.get("ai_verdict"), rec.get("ai_confidence")))])
+              rec.get("ai_verdict"), rec.get("ai_confidence"),
+              rec.get("ticket")))])
 
 def db_update_signal(rec):
     db_run([("UPDATE signals SET outcome=?, closed_ts=?, last_bar=?, entry_bar=?, "
@@ -367,12 +486,12 @@ def db_update_signal(rec):
 DB_SIGNAL_COLUMNS = ("ts", "direction", "entry", "sl", "tp", "confidence",
                      "outcome", "closed_ts", "last_bar", "entry_bar",
                      "entry_ts", "risk_usd", "mfe", "mae",
-                     "ai_verdict", "ai_confidence")
+                     "ai_verdict", "ai_confidence", "ticket")
 
 def db_load_journal(limit=None):
     rows = db_run([("SELECT ts, direction, entry, sl, tp, confidence, outcome, closed_ts, "
                     "last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
-                    "ai_verdict, ai_confidence "
+                    "ai_verdict, ai_confidence, ticket "
                     "FROM signals ORDER BY ts DESC LIMIT ?",
                     (limit or JOURNAL_MAX,))], fetch=True)
     return [dict(zip(DB_SIGNAL_COLUMNS, row)) for row in reversed(rows)]
@@ -389,13 +508,13 @@ def db_migrate_journal(records):
         return 0
     db_run([("INSERT INTO signals (ts, direction, entry, sl, tp, confidence, outcome, "
              "closed_ts, last_bar, entry_bar, entry_ts, risk_usd, mfe, mae, "
-             "ai_verdict, ai_confidence) "
-             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             "ai_verdict, ai_confidence, ticket) "
+             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
              (r["ts"], r["direction"], r.get("entry"), r.get("sl"), r.get("tp"),
               r.get("confidence"), r.get("outcome", "OPEN"), r.get("closed_ts"),
               r.get("last_bar"), r.get("entry_bar"), r.get("entry_ts"),
               r.get("risk_usd"), r.get("mfe"), r.get("mae"),
-              r.get("ai_verdict"), r.get("ai_confidence")))
+              r.get("ai_verdict"), r.get("ai_confidence"), r.get("ticket")))
             for r in records])
     return len(records)
 
@@ -472,7 +591,9 @@ def save_journal(journal):
         print(f"Journal save error ({JOURNAL_FILE}): {e}")
 
 def plan_prices(sig):
-    """The exact SL/TP quoted in the alert."""
+    """The exact SL/TP quoted in the alert, or the broker's executed levels."""
+    if sig.get("sl_price") is not None and sig.get("tp_price") is not None:
+        return round(float(sig["sl_price"]), 2), round(float(sig["tp_price"]), 2)
     if sig["signal"] == "LONG":
         return (round(sig["price"] - sig["sl_dollars"], 2),
                 round(sig["price"] + sig["tp_dollars"], 2))
@@ -490,6 +611,7 @@ def record_signal(journal, sig, opinion=None, entry_bar=None, entry_ts=None):
         "mfe": None, "mae": None,
         "ai_verdict": (opinion or {}).get("verdict"),
         "ai_confidence": (opinion or {}).get("confidence"),
+        "ticket": sig.get("ticket"),
     })
     save_journal(journal)
     db_save_signal(journal[-1])
@@ -638,6 +760,46 @@ def shadow_recent(shadow, variant, direction, now_ts):
             return now_ts - float(rec.get("ts") or 0) < SAME_DIRECTION_COOLDOWN
     return False
 
+def ob_edge_ok(sig):
+    """True when price sits in the protective half of the order block."""
+    high, low = sig.get("ob_high"), sig.get("ob_low")
+    if high is None or low is None:
+        return True
+    span = high - low
+    if span <= 0:
+        return True
+    position = (sig.get("price", 0) - low) / span
+    if sig.get("signal") == "LONG":
+        return position <= 0.5
+    return position >= 0.5
+
+def has_divergence(sig, types=None, oscillators=None, timeframe="5m",
+                   max_age=None, min_strength=None):
+    """True when any recent divergence agrees with the signal direction."""
+    direction = sig.get("signal")
+    types = tuple(types or ())
+    oscillators = tuple(oscillators or ())
+    want_obv = any(o.startswith("obv") for o in oscillators)
+    if timeframe in ("15m", "15min"):
+        key = "divergences_15m_obv" if want_obv else "divergences_15m"
+    else:
+        key = "divergences_obv" if want_obv else "divergences"
+    for item in sig.get(key) or []:
+        if item.get("direction") != direction:
+            continue
+        if types and not any(item["type"].startswith(t) for t in types):
+            continue
+        if oscillators and not any(
+                item["oscillator"] == o or item["oscillator"].startswith(o)
+                for o in oscillators):
+            continue
+        if max_age is not None and item.get("age", 999) > max_age:
+            continue
+        if min_strength is not None and item.get("strength", 0) < min_strength:
+            continue
+        return True
+    return False
+
 def shadow_variant_allows(rules, sig, now_ts):
     direction = rules.get("direction")
     if direction and sig.get("signal") != direction:
@@ -661,6 +823,30 @@ def shadow_variant_allows(rules, sig, now_ts):
         if sig.get("signal") == "LONG" and fast <= slow:
             return False
         if sig.get("signal") == "SHORT" and fast >= slow:
+            return False
+    if rules.get("require_ob_edge") and not ob_edge_ok(sig):
+        return False
+    min_adx = rules.get("min_adx")
+    if min_adx is not None:
+        if sig.get("adx") is None or sig["adx"] < min_adx:
+            return False
+    max_adx = rules.get("max_adx")
+    if max_adx is not None:
+        if sig.get("adx") is None or sig["adx"] > max_adx:
+            return False
+    if rules.get("require_stoch_cross"):
+        if sig.get("signal") == "LONG" and not sig.get("stoch_cross_up"):
+            return False
+        if sig.get("signal") == "SHORT" and not sig.get("stoch_cross_down"):
+            return False
+    if rules.get("require_divergence"):
+        if not has_divergence(
+                sig,
+                types=rules.get("divergence_types"),
+                oscillators=rules.get("divergence_oscillators"),
+                timeframe=rules.get("divergence_timeframe", "5m"),
+                max_age=rules.get("divergence_max_age"),
+                min_strength=rules.get("divergence_min_strength")):
             return False
     excluded = rules.get("exclude_utc_hours") or ()
     if excluded and datetime.fromtimestamp(now_ts, pytz.UTC).hour in excluded:
@@ -892,6 +1078,9 @@ def ai_second_opinion(sig, candles_5m, candles_15m, stats):
                           "swept_high": sig["swept_high"], "swept_low": sig["swept_low"],
                           "grab": sig["liquidity"]},
             "fvg": sig["fvg"], "pattern": sig["pattern"],
+            "stochastic": {"k": sig.get("stoch_k"), "d": sig.get("stoch_d"),
+                           "settings": [STOCH_K, STOCH_D, STOCH_SMOOTH]},
+            "divergences": sig.get("divergences") or [],
             "confluences": sig["reasons"],
         },
         "recent_bars_5m_ohlc": bars(candles_5m, 20),
@@ -1201,7 +1390,8 @@ def cmd_settings():
         f"Min confidence: {MIN_CONFIDENCE}%\n"
         f"Signal cap: {cap}\n"
         f"Same-direction cooldown: {SAME_DIRECTION_COOLDOWN // 60}m\n"
-        f"Risk/trade: ${RISK_AMOUNT:.2f} ({RISK_PERCENT*100:g}% of ${CAPITAL:.0f})\n"
+        f"Risk/trade: ${account_money(RISK_AMOUNT):.2f} "
+        f"({RISK_PERCENT*100:g}% of ${account_money(CAPITAL):.2f})\n"
         f"Max open: {MAX_OPEN_POSITIONS} | heat cap: {MAX_PORTFOLIO_HEAT_PCT*100:g}%\n"
         f"Daily loss stop: {DAILY_LOSS_LIMIT_R:.1f}R | weekend blackout: {WEEKEND_BLACKOUT_HOURS:g}h\n"
         f"Min entry ATR: {MIN_ENTRY_ATR:g} | shadow min ATR: {SHADOW_MIN_ATR:g}\n"
@@ -1210,7 +1400,8 @@ def cmd_settings():
         f"Policy: {active_policy.get('variant') if active_policy else 'env defaults'} | "
         f"auto-promote {'on' if LEARNING_AUTO_PROMOTE else 'off'}\n"
         f"Shadow: {'on' if SHADOW_ENABLED else 'off'} | min ATR {SHADOW_MIN_ATR:g} | cost ${SHADOW_SPREAD:.2f}/oz\n"
-        f"Paper mode: {PAPER_MODE}\n"
+        f"Paper mode: {PAPER_MODE} | execution: {EXECUTION_ENABLED} | "
+        f"cent account: {CENT_ACCOUNT}\n"
         f"AI: {OPENROUTER_MODEL if AI_ENABLED else 'off'}\n"
         f"DB: {db_backend()}"
     )
@@ -1310,11 +1501,33 @@ OANDA_GRANULARITY = {"1min": "M1", "5min": "M5", "15min": "M15",
 def provider_names():
     """Configured providers, in the order they are tried."""
     names = []
+    if DATA_PROVIDER in ("mt5", "auto") and mt5_data.mt5_configured():
+        names.append(f"MT5 {MT5_SYMBOL}")
     if DATA_PROVIDER == "oanda" and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         names.append(f"OANDA {OANDA_INSTRUMENT} ({OANDA_ENV})")
     if TWELVEDATA_API_KEY:
         names.append("TwelveData")
     return names
+
+_mt5_client = None
+
+def get_candles_mt5(interval="5min", outputsize=100):
+    """Closed MT5 bars, already normalised from broker time to UTC."""
+    global _mt5_client
+    if not mt5_data.mt5_configured():
+        return None
+    try:
+        if _mt5_client is None:
+            _mt5_client = mt5_data.MT5Client(
+                base_url=MT5_API_URL,
+                api_key=MT5_API_KEY,
+                symbol=MT5_SYMBOL,
+                server_tz=MT5_SERVER_TZ,
+            )
+        return _mt5_client.get_candles(interval, outputsize)
+    except Exception as e:
+        print(f"MT5 fetch error: {e}")
+        return None
 
 def get_candles_oanda(interval="5min", outputsize=100):
     """Mid-price candles from OANDA v20. Incomplete (still forming) bars are dropped."""
@@ -1375,6 +1588,11 @@ def get_candles_twelvedata(interval="5min", outputsize=100):
 def get_candles(interval="5min", outputsize=100):
     """Ask each configured provider in turn and return the first usable series."""
     providers = []
+    # MT5 first when configured. TwelveData stays behind it as a fallback so a
+    # bridge outage does not stop the scanner; both feeds are normalised to UTC
+    # before they reach closed_candles().
+    if DATA_PROVIDER in ("mt5", "auto") and mt5_data.mt5_configured():
+        providers.append(("MT5", get_candles_mt5))
     if DATA_PROVIDER == "oanda" and OANDA_API_KEY and OANDA_ACCOUNT_ID:
         providers.append(("OANDA", get_candles_oanda))
     if TWELVEDATA_API_KEY:
@@ -1382,7 +1600,8 @@ def get_candles(interval="5min", outputsize=100):
 
     if not providers:
         print("No market data provider configured "
-              "(set OANDA_API_KEY + OANDA_ACCOUNT_ID, or TWELVEDATA_API_KEY).")
+              "(set MT5_API_KEY, or OANDA_API_KEY + OANDA_ACCOUNT_ID, "
+              "or TWELVEDATA_API_KEY).")
         return None
 
     for name, fetch in providers:
@@ -1784,6 +2003,60 @@ def generate_signal(candles_5m, candles_15m):
     pattern, pat_score   = check_candle_pattern(candles_5m)
     rsi                  = calculate_rsi(candles_5m)
 
+    divergences, divergences_15m = [], []
+    divergences_obv, divergences_15m_obv = [], []
+    long_div = short_div = None
+    stoch_k_value = stoch_d_value = None
+    stoch_cross_up = stoch_cross_down = False
+    adx_value = None
+    if DIVERGENCE_ENABLED:
+        try:
+            stoch_name = f"stoch_{STOCH_K}{STOCH_D}{STOCH_SMOOTH}"
+            stoch_settings = (
+                (STOCH_K, STOCH_D, STOCH_SMOOTH, stoch_name),
+                (14, 3, 3, "stoch_1433"),
+            )
+            all_divs_5m = divergence.detect_divergences(
+                candles_5m,
+                stoch_settings=stoch_settings,
+                rsi_period=14,
+                macd_settings=(12, 26, 9),
+                include_obv=True,
+            )
+            all_divs_15m = divergence.detect_divergences(
+                candles_15m,
+                stoch_settings=stoch_settings,
+                rsi_period=14,
+                macd_settings=(12, 26, 9),
+                include_obv=True,
+            )
+            # OBV is a confirmation stream, not part of the price/oscillator
+            # divergence that the base combo uses. Keeping the two lists apart
+            # stops a volume-only split from silently changing div_hidden.
+            divergences = [d for d in all_divs_5m
+                           if d["oscillator"] != "obv"]
+            divergences_obv = [d for d in all_divs_5m
+                               if d["oscillator"] == "obv"]
+            divergences_15m = [d for d in all_divs_15m
+                               if d["oscillator"] != "obv"]
+            divergences_15m_obv = [d for d in all_divs_15m
+                                   if d["oscillator"] == "obv"]
+            long_div = divergence.best_divergence(divergences, "LONG")
+            short_div = divergence.best_divergence(divergences, "SHORT")
+            k_line, d_line = divergence.stoch_series(
+                candles_5m, STOCH_K, STOCH_D, STOCH_SMOOTH)
+            stoch_k_value = None if k_line[-1] is None else round(k_line[-1], 2)
+            stoch_d_value = None if d_line[-1] is None else round(d_line[-1], 2)
+            if len(k_line) >= 2 and None not in (
+                    k_line[-2], d_line[-2], k_line[-1], d_line[-1]):
+                stoch_cross_up = (k_line[-2] <= d_line[-2] and
+                                  k_line[-1] > d_line[-1])
+                stoch_cross_down = (k_line[-2] >= d_line[-2] and
+                                    k_line[-1] < d_line[-1])
+            adx_value = divergence.adx(candles_5m, 14)
+        except Exception as e:
+            print(f"Divergence error: {e}")
+
     print(f"\n--- ANALYSIS ---")
     print(f"Price:       {curr_price:.2f}")
     print(f"15M Bias:    {tf_bias} | BOS: {bos_type} | CHoCH: {choch}")
@@ -1795,6 +2068,14 @@ def generate_signal(candles_5m, candles_15m):
     print(f"FVG:         {fvg}")
     print(f"Pattern:     {pattern}")
     print(f"RSI:         {rsi}")
+    print(f"Stoch:       K={stoch_k_value} D={stoch_d_value} "
+          f"({STOCH_K},{STOCH_D},{STOCH_SMOOTH}) | "
+          f"cross up={stoch_cross_up} down={stoch_cross_down}")
+    print(f"Divergence:  L={divergence.describe(long_div)} | "
+          f"S={divergence.describe(short_div)}")
+    print(f"15M Div:     L={divergence.describe(divergence.best_divergence(divergences_15m, 'LONG'))} "
+          f"| S={divergence.describe(divergence.best_divergence(divergences_15m, 'SHORT'))}")
+    print(f"ADX(14):     {None if adx_value is None else round(adx_value, 2)}")
 
     # --- SCORING ---
     long_score,  long_reasons  = 0, []
@@ -1872,6 +2153,19 @@ def generate_signal(candles_5m, candles_15m):
         short_score += 8
         short_reasons.append(f"RSI Overbought ({rsi})")
 
+    # Divergence confluence. In shadow mode this only annotates the signal; in
+    # bonus mode it nudges an already-valid setup, and in filter mode the
+    # direction must find an allowed divergence before an alert is produced.
+    if DIVERGENCE_LIVE_MODE == "bonus":
+        if tf_bias == "BULLISH" and long_div:
+            weight = 1.2 if long_div["kind"] == "hidden" else 0.8
+            long_score += int(round(DIVERGENCE_BONUS * weight))
+            long_reasons.append(f"Divergence: {divergence.describe(long_div)}")
+        elif tf_bias == "BEARISH" and short_div:
+            weight = 1.2 if short_div["kind"] == "hidden" else 0.8
+            short_score += int(round(DIVERGENCE_BONUS * weight))
+            short_reasons.append(f"Divergence: {divergence.describe(short_div)}")
+
     print(f"Long: {long_score} | Short: {short_score} | Need: {MIN_CONFIDENCE}+")
 
     # --- DETERMINE SIGNAL ---
@@ -1889,6 +2183,15 @@ def generate_signal(candles_5m, candles_15m):
     if not signal:
         print("No signal.")
         return None
+
+    best_div = divergence.best_divergence(divergences, signal)
+    if DIVERGENCE_LIVE_MODE == "filter" and active_policy is None:
+        if not has_divergence(sig={"signal": signal,
+                                   "divergences": divergences},
+                              types=DIVERGENCE_FILTER_TYPES):
+            print(f"{signal} rejected: no {DIVERGENCE_FILTER_TYPES} "
+                  f"divergence.")
+            return None
 
     # LONG was buying the end of a 4h rally: 140 of 299 backtest longs entered
     # after a >+0.3% 4h move and lost 43.6R, while the rest were slightly positive.
@@ -1948,8 +2251,51 @@ def generate_signal(candles_5m, candles_15m):
         "swept_low":     swept_low,
         "liquidity":     liquidity or "None",
         "fvg":           fvg or "None",
-        "pattern":       pattern or "None"
+        "pattern":       pattern or "None",
+        "stoch_k":       stoch_k_value,
+        "stoch_d":       stoch_d_value,
+        "stoch_cross_up": stoch_cross_up,
+        "stoch_cross_down": stoch_cross_down,
+        "adx":           adx_value,
+        "divergence":    best_div,
+        "divergences":   divergences,
+        "divergences_obv": divergences_obv,
+        "divergences_15m": divergences_15m,
+        "divergences_15m_obv": divergences_15m_obv
     }
+
+# ============================================
+# EXECUTION  (opt-in demo/live order through MT5)
+# ============================================
+_executor = None
+
+def execute_signal(sig):
+    """Place one MT5 market order for a validated signal.
+
+    Returns the execution result on success, None on failure. Failure is written
+    to ``sig["execution_error"]`` so the Telegram alert can say the signal was
+    not executed.
+    """
+    global _executor
+    if not EXECUTION_ENABLED or PAPER_MODE:
+        return None
+    try:
+        import execution
+        if _executor is None:
+            _executor = execution.MT5Executor()
+        sl_price, tp_price = plan_prices(sig)
+        result = _executor.execute(
+            sig["signal"], sig["lots"], sl_price, tp_price)
+        sig["price"] = float(result["price"])
+        sig["sl_price"] = float(sl_price)
+        sig["tp_price"] = float(tp_price)
+        sig["ticket"] = result.get("ticket")
+        sig["executed"] = True
+        return result
+    except Exception as e:
+        print(f"Execution error: {e}")
+        sig["execution_error"] = str(e)[:160]
+        return None
 
 # ============================================
 # FORMAT & SEND SIGNAL
@@ -1958,12 +2304,7 @@ def send_signal(sig, candles=None):
     direction = "🟢 LONG (BUY)" if sig["signal"] == "LONG" else "🔴 SHORT (SELL)"
     emoji     = "📈" if sig["signal"] == "LONG" else "📉"
 
-    if sig["signal"] == "LONG":
-        sl_price = sig["price"] - sig["sl_dollars"]
-        tp_price = sig["price"] + sig["tp_dollars"]
-    else:
-        sl_price = sig["price"] + sig["sl_dollars"]
-        tp_price = sig["price"] - sig["tp_dollars"]
+    sl_price, tp_price = plan_prices(sig)
 
     caption = (
         f"{direction}\n"
@@ -1981,10 +2322,17 @@ def send_signal(sig, candles=None):
 
     reasons_text = "\n".join([f"  ✅ {r}" for r in sig["reasons"]])
     now_ist      = datetime.now(IST).strftime('%d %b %Y %H:%M IST')
-    mode_banner  = (
-        "🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n<i>Review only.</i>\n\n"
-        if PAPER_MODE else "⚡ <b>LIVE SIGNAL</b>\n\n"
-    )
+    if PAPER_MODE:
+        mode_banner = ("🧪 <b>PAPER SIGNAL — NOT EXECUTED</b>\n"
+                       "<i>Review only.</i>\n\n")
+    elif sig.get("executed"):
+        mode_banner = ("⚡ <b>LIVE DEMO TRADE EXECUTED</b>\n"
+                       f"<i>Ticket: {sig.get('ticket')}</i>\n\n")
+    elif sig.get("execution_error"):
+        mode_banner = ("⚠️ <b>EXECUTION FAILED — SIGNAL ONLY</b>\n"
+                       f"<i>{sig['execution_error']}</i>\n\n")
+    else:
+        mode_banner = "⚡ <b>LIVE SIGNAL</b>\n\n"
 
     ob_text = (
         f"📦 <b>Order Block:</b> {sig['ob_low']:.2f} - {sig['ob_high']:.2f} "
@@ -2001,6 +2349,11 @@ def send_signal(sig, candles=None):
                   if QUOTA_ENABLED
                   else f"{SAME_DIRECTION_COOLDOWN // 60}min same-direction cooldown only")
 
+    div_text = ""
+    if sig.get("divergence"):
+        div_text = (f"🔀 <b>Divergence:</b> {sig['divergence']['type']} "
+                    f"({sig['divergence']['oscillator']})\n")
+
     msg = f"""{mode_banner}⚔️ <b>XAUUSD SIGNAL</b> {emoji}
 ━━━━━━━━━━━━━━━━━━━━
 📊 <b>Direction:</b> {direction}
@@ -2010,7 +2363,7 @@ def send_signal(sig, candles=None):
 📦 <b>Lots:</b> {sig["lots"]}
 ⚖️ <b>R:R:</b> 1:2
 🎯 <b>Confidence:</b> {sig["confidence"]}%
-💵 <b>Max Risk:</b> ~${sig["potential_loss"]:.2f}
+💵 <b>Max Risk:</b> ~${account_money(sig["potential_loss"]):.2f}
 ━━━━━━━━━━━━━━━━━━━━
 📋 <b>WHY THIS TRADE:</b>
 {reasons_text}
@@ -2019,7 +2372,7 @@ def send_signal(sig, candles=None):
 {ob_text}{liq_text}📊 <b>FVG:</b> {sig["fvg"]}
 🕯 <b>Pattern:</b> {sig["pattern"]}
 📉 <b>RSI:</b> {sig["rsi"]}
-━━━━━━━━━━━━━━━━━━━━
+{div_text}━━━━━━━━━━━━━━━━━━━━
 🕐 {now_ist}
 ⚠️ <i>{quota_note}. Verify spread before acting.</i>"""
 
@@ -2030,7 +2383,8 @@ def send_signal(sig, candles=None):
         except OSError:
             pass
     print(f"✅ Signal: {sig['signal']} @ {sig['price']} | "
-          f"Conf: {sig['confidence']}% | Risk: ${sig['potential_loss']:.2f}")
+          f"Conf: {sig['confidence']}% | Risk: "
+          f"${account_money(sig['potential_loss']):.2f}")
 
 # ============================================
 # SESSION LABEL
@@ -2124,18 +2478,62 @@ def policy_gate(sig, now_ts=None):
             return "policy HTF EMA against LONG"
         if sig.get("signal") == "SHORT" and fast >= slow:
             return "policy HTF EMA against SHORT"
+    if policy.get("require_ob_edge") and not ob_edge_ok(sig):
+        return "policy OB edge"
+    min_adx = policy.get("min_adx")
+    if min_adx is not None:
+        if sig.get("adx") is None or sig["adx"] < min_adx:
+            return f"policy ADX < {min_adx:g}"
+    max_adx = policy.get("max_adx")
+    if max_adx is not None:
+        if sig.get("adx") is None or sig["adx"] > max_adx:
+            return f"policy ADX > {max_adx:g}"
+    if policy.get("require_stoch_cross"):
+        if sig.get("signal") == "LONG" and not sig.get("stoch_cross_up"):
+            return "policy stoch cross missing"
+        if sig.get("signal") == "SHORT" and not sig.get("stoch_cross_down"):
+            return "policy stoch cross missing"
+    if policy.get("require_divergence"):
+        if not has_divergence(
+                sig,
+                types=policy.get("divergence_types"),
+                oscillators=policy.get("divergence_oscillators"),
+                timeframe=policy.get("divergence_timeframe", "5m"),
+                max_age=policy.get("divergence_max_age"),
+                min_strength=policy.get("divergence_min_strength")):
+            return "policy divergence missing"
     return None
 
 def risk_gate(journal, sig, now_ts=None):
     """Return a human-readable reason to block a new signal, or None."""
     if not sig.get("risk_safe", True):
         limit = RISK_AMOUNT * MAX_RISK_MULTIPLE
-        return (f"min-lot risk ${float(sig.get('potential_loss') or 0):.2f} "
-                f"> ${limit:.2f}")
+        return (f"min-lot risk "
+                f"${account_money(sig.get('potential_loss') or 0):.2f} "
+                f"> ${account_money(limit):.2f}")
     policy_reason = policy_gate(sig, now_ts)
     if policy_reason:
         return policy_reason
     if active_policy is None:
+        if REQUIRE_OB_EDGE and not ob_edge_ok(sig):
+            return "OB edge filter"
+        if REQUIRE_HTF_EMA:
+            fast, slow = sig.get("ema15_fast"), sig.get("ema15_slow")
+            if fast is None or slow is None:
+                return "HTF EMA unavailable"
+            if sig.get("signal") == "LONG" and fast <= slow:
+                return "HTF EMA against LONG"
+            if sig.get("signal") == "SHORT" and fast >= slow:
+                return "HTF EMA against SHORT"
+        if REQUIRE_DIVERGENCE:
+            if not has_divergence(sig, types=DIVERGENCE_FILTER_TYPES):
+                return "divergence filter"
+        if MIN_ADX > 0:
+            if sig.get("adx") is None or sig["adx"] < MIN_ADX:
+                return f"ADX < {MIN_ADX:g}"
+        if MAX_ADX > 0:
+            if sig.get("adx") is None or sig["adx"] > MAX_ADX:
+                return f"ADX > {MAX_ADX:g}"
         atr = sig.get("atr")
         if MIN_ENTRY_ATR > 0 and (atr is None or atr < MIN_ENTRY_ATR):
             atr_txt = "n/a" if atr is None else f"{atr:.2f}"
@@ -2146,7 +2544,8 @@ def risk_gate(journal, sig, now_ts=None):
     new_risk = float(sig.get("potential_loss") or 0)
     cap = CAPITAL * MAX_PORTFOLIO_HEAT_PCT
     if heat + new_risk > cap + 1e-9:
-        return f"portfolio heat ${heat + new_risk:.2f} > ${cap:.2f}"
+        return (f"portfolio heat ${account_money(heat + new_risk):.2f} "
+                f"> ${account_money(cap):.2f}")
     return None
 
 def realized_r_today(journal, now=None):
@@ -2174,13 +2573,28 @@ def main():
     signals_sent = load_state()
 
     print("🚀 XAUUSD SMC Bot Starting...")
-    print(f"Capital: ${CAPITAL:.2f} | Risk/trade: ${RISK_AMOUNT:.2f} | "
+    print(f"Capital: ${account_money(CAPITAL):.2f} | "
+          f"Risk/trade: ${account_money(RISK_AMOUNT):.2f} | "
           f"Min Confidence: {MIN_CONFIDENCE}%")
     print(f"Risk controls: max {MAX_OPEN_POSITIONS} open | heat "
           f"{MAX_PORTFOLIO_HEAT_PCT*100:.0f}% | daily stop {DAILY_LOSS_LIMIT_R:.1f}R | "
           f"weekend blackout {WEEKEND_BLACKOUT_HOURS:g}h | "
           f"min ATR {MIN_ENTRY_ATR:g}")
-    print(f"Paper mode: {PAPER_MODE}")
+    print(f"Live gates: OB edge={REQUIRE_OB_EDGE} | HTF EMA={REQUIRE_HTF_EMA} | "
+          f"divergence={REQUIRE_DIVERGENCE} ({DIVERGENCE_FILTER_TYPES}) | "
+          f"ADX>={MIN_ADX:g} | ATR stop {ATR_STOP_MULT:g}x")
+    if RISK_AMOUNT * MAX_RISK_MULTIPLE < 10:
+        print("WARNING: CAPITAL/RISK_PERCENT is too small for a ~$10 ATR stop; "
+              "the min-lot risk gate will reject most signals. Set CAPITAL to "
+              "the real balance or lower the stop.")
+    if EXECUTION_ENABLED and PAPER_MODE:
+        print("WARNING: EXECUTION_ENABLED=1 but PAPER_MODE=1; no orders will "
+              "be sent. Set PAPER_MODE=0 to trade the demo account.")
+    if EXECUTION_ENABLED and not MT5_API_KEY:
+        print("WARNING: EXECUTION_ENABLED=1 but MT5_API_KEY is missing; "
+              "orders cannot be sent.")
+    print(f"Paper mode: {PAPER_MODE} | execution: {EXECUTION_ENABLED} | "
+          f"cent account: {CENT_ACCOUNT} | account scale {ACCOUNT_SCALE:g}")
     print(f"Data: {', '.join(provider_names()) or 'NONE configured'}")
     quota_line = (f"{MAX_TRADES_PER_DAY} signals / {SIGNAL_WINDOW_HOURS:g}h (rolling)"
                   if QUOTA_ENABLED
@@ -2234,7 +2648,8 @@ def main():
         f"{'🧪 PAPER MODE' if PAPER_MODE else '⚡ LIVE MODE'}\n\n"
         f"Strategy: BOS + CHoCH + Order Blocks\n"
         f"+ Liquidity Zones + FVG + Patterns + RSI\n\n"
-        f"Capital: ${CAPITAL} | Risk/trade: ${RISK_AMOUNT:.2f}\n"
+        f"Capital: ${account_money(CAPITAL):.2f} | "
+        f"Risk/trade: ${account_money(RISK_AMOUNT):.2f}\n"
         f"Min Confidence: {MIN_CONFIDENCE}%\n"
         f"Max Signals: {quota_line}\n"
         f"Timeframes: 5M + 15M\n\n"
@@ -2322,17 +2737,23 @@ def main():
                 elif gate:
                     print(f"⏸ Risk gate ({gate}) — {sig['signal']} @ {sig['price']} not sent.")
                 else:
+                    execution_required = EXECUTION_ENABLED and not PAPER_MODE
+                    if execution_required:
+                        execute_signal(sig)
                     send_signal(sig, candles_5m)
-                    ai_started = time.time()
-                    opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
-                    journal = record_signal(journal, sig, opinion,
-                                            candles_5m[-1]["time"], now_ts)
-                    if opinion:
-                        send_ai_opinion(sig, opinion, stats)
-                        db_save_ai_review(journal[-1], OPENROUTER_MODEL, opinion,
-                                          int((time.time() - ai_started) * 1000))
-                    signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
-                    save_state(signals_sent)
+                    if not execution_required or sig.get("executed"):
+                        ai_started = time.time()
+                        opinion = ai_second_opinion(sig, candles_5m, candles_15m, stats)
+                        journal = record_signal(journal, sig, opinion,
+                                                candles_5m[-1]["time"], now_ts)
+                        if opinion:
+                            send_ai_opinion(sig, opinion, stats)
+                            db_save_ai_review(journal[-1], OPENROUTER_MODEL, opinion,
+                                              int((time.time() - ai_started) * 1000))
+                        signals_sent.append({"ts": now_ts, "direction": sig["signal"]})
+                        save_state(signals_sent)
+                    else:
+                        print(f"Execution failed: {sig.get('execution_error')}")
                     if QUOTA_ENABLED:
                         remaining -= 1
                         if remaining == 0:

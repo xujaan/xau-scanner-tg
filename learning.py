@@ -272,6 +272,16 @@ def policy_for(variant):
         "confidence_max": None,
         "exclude_utc_hours": [],
         "require_htf_ema": False,
+        "require_ob_edge": False,
+        "require_divergence": False,
+        "require_stoch_cross": False,
+        "divergence_types": [],
+        "divergence_oscillators": [],
+        "divergence_timeframe": "5m",
+        "divergence_max_age": None,
+        "divergence_min_strength": None,
+        "min_adx": None,
+        "max_adx": None,
     }
     if variant in ("vol_high", "short_vol"):
         base["min_atr"] = bot.SHADOW_MIN_ATR
@@ -284,8 +294,61 @@ def policy_for(variant):
     if variant == "conf_70_79":
         base["confidence_min"] = 70
         base["confidence_max"] = 79
-    if variant in ("htf_ema", "htf_ema_short"):
+    if variant in ("htf_ema", "htf_ema_short", "ob_edge_htf",
+                   "ob_edge_htf_div"):
         base["require_htf_ema"] = True
+    if variant in ("ob_edge", "ob_edge_htf", "ob_edge_htf_div"):
+        base["require_ob_edge"] = True
+    if variant == "ob_edge_htf_div":
+        base["require_divergence"] = True
+        base["divergence_types"] = ["hidden"]
+    if variant.startswith("div_"):
+        base["require_divergence"] = True
+        if variant == "div_regular":
+            base["divergence_types"] = ["regular"]
+        elif variant in ("div_hidden", "div_hidden_vol"):
+            base["divergence_types"] = ["hidden"]
+        elif variant == "div_stoch":
+            base["divergence_oscillators"] = ["stoch_935"]
+        elif variant == "div_stoch_1433":
+            base["divergence_oscillators"] = ["stoch_1433"]
+        elif variant == "div_rsi":
+            base["divergence_oscillators"] = ["rsi_"]
+        elif variant == "div_macd":
+            base["divergence_oscillators"] = ["macd_hist"]
+        elif variant == "div_obv":
+            base["divergence_oscillators"] = ["obv"]
+        if variant == "div_15m":
+            base["divergence_timeframe"] = "15m"
+        if variant == "div_fresh":
+            base["divergence_max_age"] = 5
+        if variant == "div_strong":
+            base["divergence_min_strength"] = 3.0
+        if variant == "div_hidden_vol":
+            base["min_atr"] = bot.SHADOW_MIN_ATR
+    if variant == "stoch_cross":
+        base["require_stoch_cross"] = True
+    if variant == "adx_20":
+        base["min_adx"] = 20.0
+    if variant == "adx_25":
+        base["min_adx"] = 25.0
+    if variant == "adx_lt20":
+        base["max_adx"] = 20.0
+    combo = {
+        "ob_edge_htf_div_15m": {"divergence_timeframe": "15m"},
+        "ob_edge_htf_div_adx20": {"min_adx": 20.0},
+        "ob_edge_htf_div_adx25": {"min_adx": 25.0},
+        "ob_edge_htf_div_stoch": {"require_stoch_cross": True},
+        "ob_edge_htf_div_obv": {"divergence_oscillators": ["obv"]},
+        "ob_edge_htf_div_fresh": {"divergence_max_age": 5},
+        "ob_edge_htf_div_strong": {"divergence_min_strength": 3.0},
+    }
+    if variant in combo:
+        base["require_ob_edge"] = True
+        base["require_htf_ema"] = True
+        base["require_divergence"] = True
+        base["divergence_types"] = ["hidden"]
+        base.update(combo[variant])
     if variant not in CATALOG:
         return None
     base["variant"] = variant
