@@ -47,14 +47,24 @@ spec:
             - name: DB_FILE
               value: /data/signals.db
             - name: DATA_PROVIDER
-              value: twelvedata
+              value: mt5
+            - name: MT5_SYMBOL
+              value: XAUUSD
+            - name: MT5_SERVER_TZ
+              value: Europe/Kyiv
+            - name: CENT_ACCOUNT
+              value: "1"
+            - name: PAPER_MODE
+              value: "0"
+            - name: EXECUTION_ENABLED
+              value: "1"
             - name: OPENROUTER_MODEL
               value: deepseek/deepseek-v4.1-flash-1017
             # Risk controls (non-secret). Override per environment as needed.
             - name: CAPITAL
-              value: "200"
+              value: "10000"
             - name: RISK_PERCENT
-              value: "0.02"
+              value: "0.005"
             - name: MAX_RISK_MULTIPLE
               value: "2.0"
             - name: MAX_OPEN_POSITIONS
@@ -75,7 +85,7 @@ spec:
             - name: SHADOW_MIN_ATR
               value: "4.0"
             - name: SHADOW_SPREAD
-              value: "0.20"
+              value: "0.35"
             - name: LEARNING_ENABLED
               value: "1"
             - name: LEARNING_MIN_TRADES
