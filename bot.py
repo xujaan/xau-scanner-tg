@@ -673,6 +673,24 @@ def closed_candles(candles, interval="5min", now=None):
             closed.append(candle)
     return closed
 
+def candles_stale(candles, interval="5min", max_age_seconds=900):
+    """True when the newest closed bar is too old to trade.
+
+    At the Sunday open the feed can still end on Friday's last bar. Generating
+    a signal from that and sending it to a live account is a stale entry, not a
+    strategy result. A 5M feed gets 15 minutes of slack; a 15M feed gets 45.
+    """
+    if not candles:
+        return True
+    seconds = BAR_SECONDS.get(interval)
+    if not seconds:
+        return False
+    opened = bar_epoch(candles[-1].get("time"))
+    if opened is None:
+        return True
+    closed_at = opened + seconds
+    return time.time() - closed_at > max_age_seconds
+
 def evaluate_journal(journal, candles, interval_minutes=5, now=None,
                      updater=None, persist=True):
     """Resolve OPEN records from closed bars only.
@@ -2691,6 +2709,15 @@ def main():
             if not candles_5m or not candles_15m:
                 print("Fetch failed. Retry in 2min...")
                 time.sleep(120)
+                continue
+
+            if candles_stale(candles_5m, "5min"):
+                print("Stale 5M data — skipping scan to avoid a stale entry.")
+                time.sleep(60)
+                continue
+            if candles_stale(candles_15m, "15min", max_age_seconds=2700):
+                print("Stale 15M data — skipping scan to avoid a stale entry.")
+                time.sleep(60)
                 continue
 
             journal = evaluate_journal(journal, candles_5m, interval_minutes=5)
